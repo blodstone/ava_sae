@@ -5,5 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy>=2.3.5",
+    "requests>=2.32.2",
+    "datasets>=3.1.0",
+    "sae-lens>=6.37.4",
+    "torch>=2.10.0",
+    "ipykernel",
 ]
+[tool.uv.sources]
+torch = { index = "pytorch"}
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu130"
