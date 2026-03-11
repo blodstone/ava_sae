@@ -127,3 +127,7 @@ dmypy.json
 *.code-workspace
 /output/
 /wandb/
+*png
+*jpg
+*json
+*csv

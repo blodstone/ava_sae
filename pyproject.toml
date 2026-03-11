@@ -10,6 +10,8 @@ dependencies = [
     "sae-lens>=6.37.4",
     "torch>=2.10.0",
     "ipykernel",
+    "matplotlib>=3.10.8",
+    "sae-vis>=0.2.15",
 ]
 [tool.uv.sources]
 torch = { index = "pytorch"}
