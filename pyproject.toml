@@ -12,6 +12,8 @@ dependencies = [
     "ipykernel",
     "matplotlib>=3.10.8",
     "sae-vis>=0.2.15",
+    "safetensors==0.4.5",
+    "sae-dashboard",
 ]
 [tool.uv.sources]
 torch = { index = "pytorch"}
@@ -19,3 +21,6 @@ torch = { index = "pytorch"}
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu130"
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
