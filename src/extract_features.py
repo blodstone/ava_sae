@@ -137,9 +137,11 @@ def get_sae_release_id(model_name) -> tuple[str, list]:
         raise ValueError(f"Model name {model_name} not found in mapping. Please provide a valid model name.")
     return release, sae_ids
 
-def save_features_to_hdf5(writers, h5_files, sae_id, feature_acts, input_ids, attention_mask, batch_start_idx, output_dir, n_sentences):
+def save_features_to_hdf5(writers, dataset_name, h5_files, sae_id, feature_acts, input_ids, attention_mask, batch_start_idx, output_dir, n_sentences):
     if sae_id not in writers:
-        h5f = h5py.File(output_dir / f"{sae_id}.h5", "w")
+        h5_dir = output_dir / f"{dataset_name}_features"
+        h5_dir.mkdir(parents=True, exist_ok=True)
+        h5f = h5py.File(h5_dir / f"{sae_id}.h5", "w")
         h5_files[sae_id] = h5f
         writers[sae_id] = BufferedFeatureWriter(
             h5f,
@@ -187,7 +189,15 @@ def main(args):
     else:
         saes = {}  # Will load lazily in the loop
     # Process the dataset
-    with open(args.dataset_path, "r") as f:
+    if type(args.dataset_path) == str:
+        dataset_path = Path(args.dataset_path)
+    else:
+        dataset_path = args.dataset_path
+    if type(args.output_dir) == str:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = args.output_dir
+    with open(dataset_path, "r") as f:
         data = [json.loads(line) for line in f]
     
     if args.sample_size is not None:
@@ -199,7 +209,7 @@ def main(args):
     logging.info(f"Sampled {len(sampled_sentences)} sentences for interpretation.")
     batch_size = args.batch_size
 
-    output_dir = args.output_dir / args.model_name.replace("/", "_")
+    output_dir = output_dir / args.model_name.replace("/", "_")
     output_dir.mkdir(parents=True, exist_ok=True)
     h5_files = {}
     writers = {}
@@ -227,7 +237,7 @@ def main(args):
                     all_avg_sent_loglik.extend(batch_avg_sent_loglik)
 
                     # Save features to HDF5 using buffered writer
-                    save_features_to_hdf5(writers, h5_files, sae_id, feature_acts, input_ids, attention_mask, batch_start_idx=i, output_dir=output_dir, n_sentences=n_sentences)
+                    save_features_to_hdf5(writers, args.dataset_name, h5_files, sae_id, feature_acts, input_ids, attention_mask, batch_start_idx=i, output_dir=output_dir, n_sentences=n_sentences)
                 if not is_finished_calc_log:
                     save_dataset_evaluation_to_jsonl(output_dir, args.dataset_name, sampled_sentences, all_avg_sent_loglik)
                     is_finished_calc_log = True
@@ -255,7 +265,7 @@ def main(args):
                         is_first_sae = False
 
                     # Save features to HDF5 using buffered writer
-                    save_features_to_hdf5(writers, h5_files, sae_id, feature_acts, input_ids, attention_mask, batch_start_idx=i, output_dir=output_dir, n_sentences=n_sentences)
+                    save_features_to_hdf5(writers, args.dataset_name, h5_files, sae_id, feature_acts, input_ids, attention_mask, batch_start_idx=i, output_dir=output_dir, n_sentences=n_sentences)
             if not is_finished_calc_log:
                 save_dataset_evaluation_to_jsonl(output_dir, args.dataset_name, sampled_sentences, all_avg_sent_loglik)
                 is_finished_calc_log = True
