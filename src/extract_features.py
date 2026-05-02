@@ -232,7 +232,7 @@ def main(args):
                         sae, # type: ignore
                         sae_id,
                         batch_sentences,
-                        prepend_bos=False if args.model_name.startswith("gpt2") else True, 
+                        prepend_bos=True, 
                     )
                     all_avg_sent_loglik.extend(batch_avg_sent_loglik)
 
@@ -258,7 +258,7 @@ def main(args):
                         sae, # type: ignore
                         sae_id,
                         batch_sentences,
-                        prepend_bos=False if args.model_name.startswith("gpt2") else True, 
+                        prepend_bos=True, 
                     )
                     if is_first_sae:
                         all_avg_sent_loglik.extend(batch_avg_sent_loglik)
