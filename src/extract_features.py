@@ -119,6 +119,7 @@ def get_sae_release_id(model_name) -> tuple[str, list]:
         "google/gemma-3-27b-pt": "gemma-scope-2-27b-pt-res",
         "Qwen/Qwen3.5-2B": "qwen-scope-3.5-2b-base-w32k-l100",
         "Qwen/Qwen3.5-9B": "qwen-scope-3.5-9b-base-w64k-l100",
+        
     }   
     
     mapping_sae_id = {
@@ -193,10 +194,6 @@ def main(args):
         dataset_path = Path(args.dataset_path)
     else:
         dataset_path = args.dataset_path
-    if type(args.output_dir) == str:
-        output_dir = Path(args.output_dir)
-    else:
-        output_dir = args.output_dir
     with open(dataset_path, "r") as f:
         data = [json.loads(line) for line in f]
     
@@ -209,6 +206,10 @@ def main(args):
     logging.info(f"Sampled {len(sampled_sentences)} sentences for interpretation.")
     batch_size = args.batch_size
 
+    if type(args.output_dir) == str:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = args.output_dir
     output_dir = output_dir / args.model_name.replace("/", "_")
     output_dir.mkdir(parents=True, exist_ok=True)
     h5_files = {}
@@ -284,7 +285,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='gpt2')
     parser.add_argument('--dataset_name', type=str, default='blimp')
-    parser.add_argument('--dataset_path', type=str, default=PROJECT_ROOT / "data" / "input_data" / "blimp_data.jsonl")
+    parser.add_argument('--dataset_path', type=Path, default=PROJECT_ROOT / "data" / "input_data" / "blimp_data.jsonl")
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--output_dir', type=Path, default=PROJECT_ROOT / "output" / "features") # tune: change to "features" for full run
     parser.add_argument('--sample_size', type=int, default=None, help="Number of sentences to sample from the dataset for testing. Set to None for no limit.")
