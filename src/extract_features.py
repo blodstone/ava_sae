@@ -64,7 +64,8 @@ def run_model_with_targeted_cache(model, model_name, sae, sae_id, sampled_senten
         logits, cache = model.run_with_cache_with_saes(
             sampled_sentences,
             saes=[sae],
-            prepend_bos=prepend_bos
+            prepend_bos=prepend_bos,
+            use_error_term=True
         )
         input_ids = model.to_tokens(sampled_sentences, prepend_bos=prepend_bos)
         pad_id = model.tokenizer.pad_token_id or model.tokenizer.eos_token_id
