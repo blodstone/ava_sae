@@ -190,10 +190,7 @@ def main(args):
     else:
         saes = {}  # Will load lazily in the loop
     # Process the dataset
-    if type(args.dataset_path) == str:
-        dataset_path = Path(args.dataset_path)
-    else:
-        dataset_path = args.dataset_path
+    dataset_path = args.dataset_path
     with open(dataset_path, "r") as f:
         data = [json.loads(line) for line in f]
     
@@ -206,10 +203,7 @@ def main(args):
     logging.info(f"Sampled {len(sampled_sentences)} sentences for interpretation.")
     batch_size = args.batch_size
 
-    if type(args.output_dir) == str:
-        output_dir = Path(args.output_dir)
-    else:
-        output_dir = args.output_dir
+    output_dir = args.output_dir
     output_dir = output_dir / args.model_name.replace("/", "_")
     output_dir.mkdir(parents=True, exist_ok=True)
     h5_files = {}

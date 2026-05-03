@@ -45,7 +45,7 @@ def load_random_feature_ids(phi_path: Path, top_k: int = 10) -> np.ndarray:
     sorted_phi_idx = data["sorted_phi_idx"]
     sorted_phi_values = data["sorted_phi_values"]
     # any activated feature
-    pos_mask = ~(sorted_phi_values == 0)
+    pos_mask = sorted_phi_values > 0
     feature_ids = sorted_phi_idx[pos_mask]
     random_feature_ids = np.random.choice(feature_ids, size=min(top_k, len(feature_ids)), replace=False)
     logging.info(
