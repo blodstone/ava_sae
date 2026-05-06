@@ -26,7 +26,7 @@ def ablate_feature(sae_acts, hook, feature_id):
     sae_acts[:, :, feature_id] = 0.0
     return sae_acts
 
-def load_positive_feature_ids(phi_path: Path, top_k: int = 10) -> np.ndarray:
+def load_positive_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0) -> np.ndarray:
     """Return top-k feature indices by descending phi score (positive-phi only)."""
     data = np.load(phi_path)
     sorted_phi_idx = data["sorted_phi_idx"]
@@ -37,9 +37,9 @@ def load_positive_feature_ids(phi_path: Path, top_k: int = 10) -> np.ndarray:
         f"Loaded {len(feature_ids)} positive-phi features "
         f"(out of {len(sorted_phi_idx)} total) from {phi_path}, using top {top_k}"
     )
-    return feature_ids[:top_k]
+    return feature_ids[rank_i: rank_i + top_k]
 
-def load_random_feature_ids(phi_path: Path, top_k: int = 10) -> np.ndarray:
+def load_random_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0) -> np.ndarray:
     """Return top-k feature indices by descending phi score (nonzero-phi only)."""
     data = np.load(phi_path)
     sorted_phi_idx = data["sorted_phi_idx"]
@@ -55,7 +55,7 @@ def load_random_feature_ids(phi_path: Path, top_k: int = 10) -> np.ndarray:
     return random_feature_ids
 
 
-def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, sentences, 
+def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, phi_files, sentences, 
                                      all_layers_loglikelihoods_base, all_layers_loglikelihoods_abl, all_layers_loglikelihoods_random):
     total_pref_margins_constraint_violation = []
     total_pref_margins_well_formedness = []
@@ -96,10 +96,6 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, sentences,
         average_control_pref_margin_well_formedness = np.mean(control_pref_margins_well_formedness)
         total_control_pref_margins_constraint_violation.append(average_control_pref_margin_constraint_violation)
         total_control_pref_margins_well_formedness.append(average_control_pref_margin_well_formedness)
-    max_total_control_pref_margin_constraint_violation = max(total_control_pref_margins_constraint_violation)
-    l_star_total_control_pref_margin_constraint_violation = total_control_pref_margins_constraint_violation.index(max_total_control_pref_margin_constraint_violation)
-    max_total_control_pref_margin_well_formedness = max(total_control_pref_margins_well_formedness)
-    l_star_total_control_pref_margin_well_formedness = total_control_pref_margins_well_formedness.index(max_total_control_pref_margin_well_formedness)
     max_total_pref_margin_constraint_violation = max(total_pref_margins_constraint_violation)
     l_star_total_pref_margin_constraint_violation = total_pref_margins_constraint_violation.index(max_total_pref_margin_constraint_violation)
     max_total_pref_margin_well_formedness = max(total_pref_margins_well_formedness)
@@ -107,12 +103,12 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, sentences,
 
     wilcoxon_stat_constraint, wilcoxon_pvalue_constraint = wilcoxon(
         all_pref_margins_constraint_violation[l_star_total_pref_margin_constraint_violation],
-        all_control_pref_margins_constraint_violation[l_star_total_control_pref_margin_constraint_violation],
+        all_control_pref_margins_constraint_violation[l_star_total_pref_margin_constraint_violation],
         alternative="greater",
     )
     wilcoxon_stat_well_formedness, wilcoxon_pvalue_well_formedness = wilcoxon(
         all_pref_margins_well_formedness[l_star_total_pref_margin_well_formedness],
-        all_control_pref_margins_well_formedness[l_star_total_control_pref_margin_well_formedness],
+        all_control_pref_margins_well_formedness[l_star_total_pref_margin_well_formedness],
         alternative="two-sided",
     )
     constraint_significant = wilcoxon_pvalue_constraint < 0.001/len(all_layers_loglikelihoods_base)  # Bonferroni correction for multiple layers
@@ -121,14 +117,10 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, sentences,
 
     bonferroni_alpha = 0.001 / len(all_layers_loglikelihoods_base)
     with open(output_path, "w") as f:
-        f.write(f"Best layer index (constraint violation): {l_star_total_pref_margin_constraint_violation}\n")
-        f.write(f"Best layer index (well-formedness): {l_star_total_pref_margin_well_formedness}\n")
-        f.write(f"Best control layer index (constraint violation): {l_star_total_control_pref_margin_constraint_violation}\n")
-        f.write(f"Best control layer index (well-formedness): {l_star_total_control_pref_margin_well_formedness}\n")
+        f.write(f"Best layer (constraint violation): {phi_files[l_star_total_pref_margin_constraint_violation].stem}\n")
+        f.write(f"Best layer (well-formedness): {phi_files[l_star_total_pref_margin_well_formedness].stem}\n")
         f.write(f"Max average preference margin constraint violation (best layer): {max_total_pref_margin_constraint_violation:.6f}\n")
-        f.write(f"Max average control preference margin constraint violation (best layer): {max_total_control_pref_margin_constraint_violation:.6f}\n")
         f.write(f"Max average preference margin well-formedness (best layer): {max_total_pref_margin_well_formedness:.6f}\n")
-        f.write(f"Max average control preference margin well-formedness (best layer): {max_total_control_pref_margin_well_formedness:.6f}\n")
         f.write(f"Wilcoxon signed-rank stat (constraint_violation vs control): {wilcoxon_stat_constraint:.6f}\n")
         f.write(f"Wilcoxon signed-rank p-value (constraint_violation vs control): {wilcoxon_pvalue_constraint:.6e}\n")
         f.write(f"Wilcoxon significant (constraint_violation vs control, alpha={bonferroni_alpha:.6f}): {constraint_significant}\n")
@@ -174,9 +166,8 @@ def main(args):
     for phi_path in phi_files:
         # Infer sae_id from filename: strip trailing _phi.npz
         sae_id = phi_path.stem
-        feature_ids = load_positive_feature_ids(phi_path)
-        random_feature_ids = load_random_feature_ids(phi_path)
-
+        feature_ids = load_positive_feature_ids(phi_path, top_k=args.top_k)
+        random_feature_ids = load_random_feature_ids(phi_path, top_k=args.top_k)
         sae = load_sae_model(release, sae_id)
         all_avg_sent_loglik_abl = []
         all_avg_sent_loglik_base = []
@@ -193,7 +184,7 @@ def main(args):
         all_layers_avg_sent_loglik_base.append(all_avg_sent_loglik_base)
         all_layers_avg_sent_loglik_random.append(all_avg_sent_loglik_random)
     save_dataset_evaluation_to_jsonl(
-        output_dir, args.dataset_name, sampled_sentences,
+        output_dir, args.dataset_name, phi_files, sampled_sentences,
         all_layers_avg_sent_loglik_abl, all_layers_avg_sent_loglik_base, all_layers_avg_sent_loglik_random
     ) 
 
@@ -214,7 +205,6 @@ def run_model_with_ablation(
     else:
         hook_block_name = f'blocks.{layer_number}.hook_out.hook_sae_acts_post'
 
-    results = []
     input_ids = model.to_tokens(sampled_sentences, prepend_bos=prepend_bos)
     pad_id = model.tokenizer.pad_token_id or model.tokenizer.eos_token_id
     attention_mask = (input_ids != pad_id).long()
@@ -264,7 +254,8 @@ if __name__ == '__main__':
         default=PROJECT_ROOT / "data" / "input_data" / "blimp_data.jsonl",
     )
     parser.add_argument("--dataset_name", type=str, default="blimp", help="Name of the dataset (for output file naming).")
-    parser.add_argument('--top_k', type=int, default=10, help="Number of top +/- Phi features to print.")
+    parser.add_argument('--top_k', type=int, default=10, help='Number of top positive-phi features to ablate per layer.')
+    parser.add_argument('--rank_i', type=int, default=0, help='Rank index for random feature selection (if using --random_features).')
     parser.add_argument(
         "--output_dir", type=Path,
         default=PROJECT_ROOT / "output" / "features",

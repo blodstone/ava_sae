@@ -50,6 +50,7 @@ def compute_phi_l(
     h5f: h5py.File,
     sentence_indices: list[int],
     n_features: int,
+    lambda_: float = 1.0
 ) -> np.ndarray:
     """
     Compute Phi_j^(l) = (1 / (|D| * T)) * sum_i sum_t (z_bad - z_good)
@@ -75,7 +76,7 @@ def compute_phi_l(
             continue
 
         np.add.at(phi_sum, bad_sent_data["feature_idx"], bad_sent_data["feature_values"].astype(np.float64))
-        np.add.at(phi_sum, good_sent_data["feature_idx"], -good_sent_data["feature_values"].astype(np.float64))
+        np.add.at(phi_sum, good_sent_data["feature_idx"], -lambda_ * good_sent_data["feature_values"].astype(np.float64) * good_sent_data["feature_values"].astype(np.float64))
         total_tokens += t
 
     if total_tokens == 0 or n_pairs == 0:
@@ -83,7 +84,7 @@ def compute_phi_l(
 
     return (phi_sum / float(total_tokens)).astype(np.float32)
 
-def _process_one(h5_path: Path, out_path: Path, sentence_idx, start_idx: int, end_idx) -> None:
+def _process_one(h5_path: Path, out_path: Path, sentence_idx, start_idx: int, end_idx, lambda_: float = 1.0) -> None:
     with h5py.File(h5_path, "r") as h5f:
         ds_offsets = cast(h5py.Dataset, h5f["offsets"])
         n_features = cast(int, h5f.attrs.get("n_features", 0))
@@ -94,7 +95,7 @@ def _process_one(h5_path: Path, out_path: Path, sentence_idx, start_idx: int, en
             start_idx=start_idx,
             end_idx=end_idx,
         )
-        phi_l = compute_phi_l(h5f, sentence_indices=sentence_indices, n_features=n_features)
+        phi_l = compute_phi_l(h5f, sentence_indices=sentence_indices, n_features=n_features, lambda_=lambda_)
 
     sorted_phi_idx = np.argsort(phi_l)[::-1]
     sorted_phi_values = phi_l[sorted_phi_idx]
@@ -114,12 +115,12 @@ def main(args):
             out_path = h5_path.with_suffix(".npz")
             import logging
             logging.info(f"Processing {h5_path.name} -> {out_path.name}")
-            _process_one(h5_path, out_path, args.sentence_idx, args.start_idx, args.end_idx)
+            _process_one(h5_path, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.lambda_)
     else:
         if args.h5_path is None:
             raise ValueError("Provide either --h5_path or --h5_dir.")
         out_path = args.out_path if args.out_path is not None else args.h5_path.with_suffix(".npz")
-        _process_one(args.h5_path, out_path, args.sentence_idx, args.start_idx, args.end_idx)
+        _process_one(args.h5_path, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.lambda_)
 
 
 if __name__ == '__main__':
@@ -131,6 +132,7 @@ if __name__ == '__main__':
     parser.add_argument("--sentence_idx", type=int, default=None, help="Process a single sentence index.")
     parser.add_argument("--start_idx", type=int, default=0, help="Start of sentence range (inclusive).")
     parser.add_argument("--end_idx", type=int, default=None, help="End of sentence range (exclusive). Defaults to all sentences.")
+    parser.add_argument("--lambda_", type=float, default=1.0, help="Regularization parameter.")
 
     args = parser.parse_args()
     main(args)
