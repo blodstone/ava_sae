@@ -1,9 +1,9 @@
-import random
 import argparse
 import json
 import logging
 from pathlib import Path
 
+import h5py
 import numpy as np
 import torch
 from sae_lens import SAE
@@ -11,9 +11,8 @@ from functools import partial
 import tqdm
 from scipy.stats import wilcoxon
 
-from extract_features import calculate_accuracy, calculate_preference_margin, compute_log_likelihood, extract_layer_number, extract_layer_number, get_sae_release_id, load_model, load_sae_model
+from extract_features import calculate_preference_margin, compute_log_likelihood, extract_layer_number, get_sae_release_id, load_model, load_sae_model
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-random.seed(42)
 np.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
@@ -22,8 +21,8 @@ torch.set_grad_enabled(False)
 
 
 
-def ablate_feature(sae_acts, hook, feature_id):
-    sae_acts[:, :, feature_id] = 0.0
+def ablate_features(sae_acts, hook, feature_ids):
+    sae_acts[:, :, feature_ids] = 0.0
     return sae_acts
 
 def load_positive_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0) -> np.ndarray:
@@ -39,18 +38,84 @@ def load_positive_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0) 
     )
     return feature_ids[rank_i: rank_i + top_k]
 
-def load_random_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0) -> np.ndarray:
-    """Return top-k feature indices by descending phi score (nonzero-phi only)."""
+def log_feature_sentence_distribution(phi_path: Path, feature_ids: np.ndarray, n_sentences: int | None = None, output_dir: Path | None = None) -> None:
+    """For each top feature, log pair-level counts matching the phi non-overlap criterion (BOS excluded)."""
+    h5_path = phi_path.with_suffix(".h5")
+    if not h5_path.exists():
+        logging.warning(f"H5 file not found at {h5_path}, skipping feature distribution logging.")
+        return
+
+    feature_id_set = set(int(f) for f in feature_ids)
+    # per-feature pair counts: bad_only (phi-eligible), good_only, both
+    sent_counts: dict[int, dict[str, int]] = {fid: {"bad_only": 0, "good_only": 0, "both": 0} for fid in feature_id_set}
+
+    with h5py.File(h5_path, "r") as h5f:
+        offsets = np.asarray(h5f["offsets"])
+        feature_idx_ds = h5f["feature_idx"]
+        token_idx_ds = h5f["token_idx"]
+        total = int(h5f.attrs.get("n_sentences", len(offsets) - 1))
+        if n_sentences is not None:
+            total = min(total, n_sentences)
+        n_pairs = total // 2  # ensure even
+
+        for pair_i in range(n_pairs):
+            good_i, bad_i = pair_i * 2, pair_i * 2 + 1
+
+            gs, ge = int(offsets[good_i]), int(offsets[good_i + 1])
+            if ge > gs:
+                good_tok = np.asarray(token_idx_ds[gs:ge])
+                good_feat = np.asarray(feature_idx_ds[gs:ge])
+                good_feat_set = set(int(f) for f in good_feat[good_tok != 0])
+            else:
+                good_feat_set = set()
+
+            bs, be = int(offsets[bad_i]), int(offsets[bad_i + 1])
+            if be > bs:
+                bad_tok = np.asarray(token_idx_ds[bs:be])
+                bad_feat = np.asarray(feature_idx_ds[bs:be])
+                bad_feat_set = set(int(f) for f in bad_feat[bad_tok != 0])
+            else:
+                bad_feat_set = set()
+
+            for fid in feature_id_set:
+                in_good = fid in good_feat_set
+                in_bad  = fid in bad_feat_set
+                if in_bad and not in_good:
+                    sent_counts[fid]["bad_only"] += 1
+                elif in_good and not in_bad:
+                    sent_counts[fid]["good_only"] += 1
+                elif in_good and in_bad:
+                    sent_counts[fid]["both"] += 1
+
+    lines = [f"Feature distribution across pairs ({phi_path.stem}, n_pairs={n_pairs}):"]
+    lines.append(f"  {'Feature':>10}  {'bad_only':>10}  {'good_only':>10}  {'both':>6}  {'bad_only_%':>11}  {'good_only_%':>12}")
+    for fid in feature_ids:
+        fid = int(fid)
+        bo = sent_counts[fid]["bad_only"]
+        go = sent_counts[fid]["good_only"]
+        bt = sent_counts[fid]["both"]
+        lines.append(f"  {fid:>10}  {bo:>10}  {go:>10}  {bt:>6}  {100.0*bo/n_pairs:>10.1f}%  {100.0*go/n_pairs:>11.1f}%")
+    text = "\n".join(lines)
+    logging.info(text)
+    if output_dir is not None:
+        out_path = output_dir / f"{phi_path.stem}_feature_distribution.txt"
+        out_path.write_text(text + "\n")
+
+
+def load_random_feature_ids(phi_path: Path, top_k: int = 10, exclude_feature_ids: np.ndarray | None = None) -> np.ndarray:
+    """Return top_k feature indices sampled uniformly at random from activated features, excluding exclude_feature_ids."""
     data = np.load(phi_path)
     sorted_phi_idx = data["sorted_phi_idx"]
     sorted_phi_values = data["sorted_phi_values"]
-    # any activated feature
-    pos_mask = sorted_phi_values > 0
-    feature_ids = sorted_phi_idx[pos_mask]
-    random_feature_ids = np.random.choice(feature_ids, size=min(top_k, len(feature_ids)), replace=False)
+    # Only sample from features that actually fire on this dataset (non-zero phi)
+    activated_ids = sorted_phi_idx[sorted_phi_values != 0]
+    if exclude_feature_ids is not None and len(exclude_feature_ids) > 0:
+        exclude_set = set(int(f) for f in exclude_feature_ids)
+        activated_ids = activated_ids[~np.isin(activated_ids, list(exclude_set))]
+    random_feature_ids = np.random.choice(activated_ids, size=min(top_k, len(activated_ids)), replace=False)
     logging.info(
-        f"Loaded {len(feature_ids)} activated-phi features "
-        f"(out of {len(sorted_phi_idx)} total) from {phi_path}, using top {top_k}"
+        f"Sampled {len(random_feature_ids)} random control features "
+        f"(from {len(activated_ids)} activated eligible out of {len(sorted_phi_idx)} total) from {phi_path}"
     )
     return random_feature_ids
 
@@ -101,11 +166,13 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, phi_files, senten
     max_total_pref_margin_well_formedness = max(total_pref_margins_well_formedness)
     l_star_total_pref_margin_well_formedness = total_pref_margins_well_formedness.index(max_total_pref_margin_well_formedness)
 
+    # "greater": directional hypothesis — ablating bad-sensitive features should raise bad-sentence log-likelihood
     wilcoxon_stat_constraint, wilcoxon_pvalue_constraint = wilcoxon(
         all_pref_margins_constraint_violation[l_star_total_pref_margin_constraint_violation],
         all_control_pref_margins_constraint_violation[l_star_total_pref_margin_constraint_violation],
         alternative="greater",
     )
+    # "two-sided": no directional hypothesis for well-formedness (ablation may help or hurt good sentences)
     wilcoxon_stat_well_formedness, wilcoxon_pvalue_well_formedness = wilcoxon(
         all_pref_margins_well_formedness[l_star_total_pref_margin_well_formedness],
         all_control_pref_margins_well_formedness[l_star_total_pref_margin_well_formedness],
@@ -127,6 +194,25 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, phi_files, senten
         f.write(f"Wilcoxon signed-rank stat (well_formedness vs control): {wilcoxon_stat_well_formedness:.6f}\n")
         f.write(f"Wilcoxon signed-rank p-value (well_formedness vs control): {wilcoxon_pvalue_well_formedness:.6e}\n")
         f.write(f"Wilcoxon significant (well_formedness vs control, alpha={bonferroni_alpha:.6f}): {well_formedness_significant}\n")
+        f.write("\n--- Per-layer results ---\n")
+        for layer_idx, phi_file in enumerate(phi_files):
+            wstat_c, wpval_c = wilcoxon(
+                all_pref_margins_constraint_violation[layer_idx],
+                all_control_pref_margins_constraint_violation[layer_idx],
+                alternative="greater",
+            )
+            wstat_w, wpval_w = wilcoxon(
+                all_pref_margins_well_formedness[layer_idx],
+                all_control_pref_margins_well_formedness[layer_idx],
+                alternative="two-sided",
+            )
+            f.write(f"\nLayer: {phi_file.stem}\n")
+            f.write(f"  avg pref margin (constraint violation): {total_pref_margins_constraint_violation[layer_idx]:.6f}\n")
+            f.write(f"  avg pref margin (well-formedness):      {total_pref_margins_well_formedness[layer_idx]:.6f}\n")
+            f.write(f"  avg control margin (constraint):        {total_control_pref_margins_constraint_violation[layer_idx]:.6f}\n")
+            f.write(f"  avg control margin (well-formedness):   {total_control_pref_margins_well_formedness[layer_idx]:.6f}\n")
+            f.write(f"  Wilcoxon (constraint): stat={wstat_c:.6f}, p={wpval_c:.6e}, sig={wpval_c < bonferroni_alpha}\n")
+            f.write(f"  Wilcoxon (well-form.): stat={wstat_w:.6f}, p={wpval_w:.6e}, sig={wpval_w < bonferroni_alpha}\n")
     logging.info(
         f"Wilcoxon signed-rank test ({dataset_name}): stat={wilcoxon_stat_constraint:.6f}, p={wilcoxon_pvalue_constraint:.6e}"
     )
@@ -152,7 +238,7 @@ def main(args):
     for dataline in data:
         sampled_sentences.append(dataline[0]["prompt"])
         sampled_sentences.append(dataline[1]["prompt"])
-    if type(args.output_dir) == str:
+    if isinstance(args.output_dir, str):
         output_dir = Path(args.output_dir)
     else:
         output_dir = args.output_dir
@@ -160,20 +246,22 @@ def main(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     
     batch_size = args.batch_size
+
     all_layers_avg_sent_loglik_abl = []
     all_layers_avg_sent_loglik_base = []
     all_layers_avg_sent_loglik_random = []
     for phi_path in phi_files:
-        # Infer sae_id from filename: strip trailing _phi.npz
+        # Infer sae_id from filename
         sae_id = phi_path.stem
         feature_ids = load_positive_feature_ids(phi_path, top_k=args.top_k)
-        random_feature_ids = load_random_feature_ids(phi_path, top_k=args.top_k)
+        log_feature_sentence_distribution(phi_path, feature_ids, n_sentences=args.n_pairs * 2 if args.n_pairs else None, output_dir=output_dir)
+        random_feature_ids = load_random_feature_ids(phi_path, top_k=args.top_k, exclude_feature_ids=feature_ids)
         sae = load_sae_model(release, sae_id)
         all_avg_sent_loglik_abl = []
         all_avg_sent_loglik_base = []
         all_avg_sent_loglik_random = []
         for i in tqdm.tqdm(range(0, len(sampled_sentences), batch_size)):
-            batch_sentences = sampled_sentences[i:i+batch_size]        
+            batch_sentences = sampled_sentences[i:i+batch_size]
             batch_avg_sent_loglik_abl, batch_avg_sent_loglik_base, batch_avg_sent_loglik_random = run_model_with_ablation(
                 model, args.model_name, sae, sae_id, feature_ids, random_feature_ids, batch_sentences
             )
@@ -214,24 +302,28 @@ def run_model_with_ablation(
         saes=[sae],
         prepend_bos=True,
         use_error_term=True,
-        fwd_hooks=[(hook_block_name, partial(ablate_feature, feature_id=feature_ids))],  # Identity forward hook to capture activations
+        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=feature_ids))],
     )
-    # ---- baseline pass ------------------------------------------------
-    logits_base, _ = model.run_with_cache(sampled_sentences, prepend_bos=True)
-    
-    # ---- random pass ------------------------------------------------
-    logits_random  = model.run_with_hooks_with_saes(
+    # ---- baseline pass (SAE active, no features ablated) -------------
+    logits_base = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
         prepend_bos=True,
         use_error_term=True,
-        fwd_hooks=[(hook_block_name, partial(ablate_feature, feature_id=random_feature_ids))],  # Identity forward hook to capture activations
+        fwd_hooks=[],
+    )
+    # ---- random pass ------------------------------------------------
+    logits_random = model.run_with_hooks_with_saes(
+        sampled_sentences,
+        saes=[sae],
+        prepend_bos=True,
+        use_error_term=True,
+        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=random_feature_ids))],
     )
 
     batch_avg_sent_loglik_abl = compute_log_likelihood(logits_abl, input_ids, attention_mask)
     batch_avg_sent_loglik_base = compute_log_likelihood(logits_base, input_ids, attention_mask)
     batch_avg_sent_loglik_random = compute_log_likelihood(logits_random, input_ids, attention_mask)
-    # ---- record per-pair results ----------------------------------------
     return batch_avg_sent_loglik_abl, batch_avg_sent_loglik_base, batch_avg_sent_loglik_random
 
 

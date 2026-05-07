@@ -52,17 +52,17 @@ def compute_phi_l(
     n_features: int,
     lambda_: float = 1.0
 ) -> np.ndarray:
-    """
-    Compute Phi_j^(l) = (1 / (|D| * T)) * sum_i sum_t (z_bad - z_good)
-    over paired sentence indices [good_0, bad_0, good_1, bad_1, ...].
-    Returns shape: (n_features,).
-    """
     if len(sentence_indices) % 2 != 0:
         raise ValueError("sentence_indices must contain an even number of entries (good/bad pairs).")
 
     n_pairs = len(sentence_indices) // 2
     phi_sum = np.zeros(n_features, dtype=np.float64)
     total_tokens = 0
+
+    # Track pair-level counts for correct distribution reporting
+    bad_only_pair_count = np.zeros(n_features, dtype=np.int32)   # bad but not good (φ-eligible)
+    good_only_pair_count = np.zeros(n_features, dtype=np.int32)  # good but not bad
+    both_pair_count = np.zeros(n_features, dtype=np.int32)       # both good and bad
 
     for pos in tqdm.tqdm(range(0, len(sentence_indices), 2)):
         good_idx = sentence_indices[pos]
@@ -75,13 +75,54 @@ def compute_phi_l(
         if t == 0:
             continue
 
-        np.add.at(phi_sum, bad_sent_data["feature_idx"], bad_sent_data["feature_values"].astype(np.float64))
-        np.add.at(phi_sum, good_sent_data["feature_idx"], -lambda_ * good_sent_data["feature_values"].astype(np.float64) * good_sent_data["feature_values"].astype(np.float64))
+        # Exclude BOS token (index 0) from both sentences before computing phi
+        good_bos_mask = good_sent_data["token_idx"] != 0
+        bad_bos_mask  = bad_sent_data["token_idx"]  != 0
+        good_feat_set = set(good_sent_data["feature_idx"][good_bos_mask])
+        bad_feat_set  = set(bad_sent_data["feature_idx"][bad_bos_mask])
+
+        # Pair-level set operations
+        bad_only  = bad_feat_set - good_feat_set   # φ-eligible
+        good_only = good_feat_set - bad_feat_set
+        both      = good_feat_set & bad_feat_set
+
+        np.add.at(bad_only_pair_count,  list(bad_only),  1)
+        np.add.at(good_only_pair_count, list(good_only), 1)
+        np.add.at(both_pair_count,      list(both),      1)
+
+        # φ accumulation (unchanged)
+        bad_feat_idx = bad_sent_data["feature_idx"][bad_bos_mask]
+        bad_non_overlap_mask = np.array([idx in bad_only for idx in bad_feat_idx])
+        non_overlap_bad_idx  = bad_feat_idx[bad_non_overlap_mask]
+        non_overlap_bad_vals = bad_sent_data["feature_values"][bad_bos_mask][bad_non_overlap_mask].astype(np.float64)
+        np.add.at(phi_sum, non_overlap_bad_idx, non_overlap_bad_vals)
+
         total_tokens += t
 
     if total_tokens == 0 or n_pairs == 0:
         raise ValueError("No sentence pairs provided.")
 
+    distribution = {
+        "bad_only_pairs":  bad_only_pair_count,   # should match φ; good_% = 0 by construction
+        "good_only_pairs": good_only_pair_count,
+        "both_pairs":      both_pair_count,
+        "n_pairs":         n_pairs,
+    }
+
+    print("Distribution of feature presence across good/bad pairs:")
+    for category, counts in distribution.items():
+        if category != "n_pairs":
+            print(f"  {category}: {np.sum(counts)} features (mean {np.mean(counts):.2f} pairs/feature)")
+        else:
+            print(f"  {category}: {counts}")
+    both_threshold = max(1, int(0.02 * n_pairs))  # e.g. 20 pairs out of 1000
+    both_mask = both_pair_count > both_threshold
+    phi_sum[both_mask] = 0.0
+    
+    logging.info(
+        f"Zeroed out {both_mask.sum()} features that appeared in both "
+        f"good and bad sentences (both_pair_count > 0)."
+    )
     return (phi_sum / float(total_tokens)).astype(np.float32)
 
 def _process_one(h5_path: Path, out_path: Path, sentence_idx, start_idx: int, end_idx, lambda_: float = 1.0) -> None:
