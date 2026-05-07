@@ -72,8 +72,8 @@ def compute_phi_l(
         bad_sent_data = _read_sentence_sparse(h5f, bad_idx)
 
         t = min(len(good_sent_data["tokens"]), len(bad_sent_data["tokens"]))
-        if t == 0:
-            continue
+        # if t == 0:
+        #     continue
 
         # Exclude BOS token (index 0) from both sentences before computing phi
         good_bos_mask = good_sent_data["token_idx"] != 0
@@ -91,11 +91,9 @@ def compute_phi_l(
         np.add.at(both_pair_count,      list(both),      1)
 
         # φ accumulation (unchanged)
-        bad_feat_idx = bad_sent_data["feature_idx"][bad_bos_mask]
-        bad_non_overlap_mask = np.array([idx in bad_only for idx in bad_feat_idx])
-        non_overlap_bad_idx  = bad_feat_idx[bad_non_overlap_mask]
-        non_overlap_bad_vals = bad_sent_data["feature_values"][bad_bos_mask][bad_non_overlap_mask].astype(np.float64)
-        np.add.at(phi_sum, non_overlap_bad_idx, non_overlap_bad_vals)
+        np.add.at(phi_sum, bad_sent_data['feature_idx'], bad_sent_data['feature_values'].astype(np.float64))
+        np.add.at(phi_sum, good_sent_data['feature_idx'], -good_sent_data['feature_values'].astype(np.float64))
+
 
         total_tokens += t
 
@@ -115,14 +113,14 @@ def compute_phi_l(
             print(f"  {category}: {np.sum(counts)} features (mean {np.mean(counts):.2f} pairs/feature)")
         else:
             print(f"  {category}: {counts}")
-    both_threshold = max(1, int(0.02 * n_pairs))  # e.g. 20 pairs out of 1000
-    both_mask = both_pair_count > both_threshold
-    phi_sum[both_mask] = 0.0
+    # both_threshold = max(1, int(0.02 * n_pairs))  # e.g. 20 pairs out of 1000
+    # both_mask = both_pair_count > both_threshold
+    # phi_sum[both_mask] = 0.0
     
-    logging.info(
-        f"Zeroed out {both_mask.sum()} features that appeared in both "
-        f"good and bad sentences (both_pair_count > 0)."
-    )
+    # logging.info(
+    #     f"Zeroed out {both_mask.sum()} features that appeared in both "
+    #     f"good and bad sentences (both_pair_count > {both_threshold})."
+    # )
     return (phi_sum / float(total_tokens)).astype(np.float32)
 
 def _process_one(h5_path: Path, out_path: Path, sentence_idx, start_idx: int, end_idx, lambda_: float = 1.0) -> None:

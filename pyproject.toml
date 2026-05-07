@@ -8,6 +8,7 @@ dependencies = [
     "requests>=2.32.2",
     "datasets>=3.1.0",
     "sae-lens>=6.37.4",
+    "transformer-lens>=3.0.0",
     "torch>=2.10.0",
     "matplotlib>=3.10.8",
     "sae-vis>=0.2.15",
@@ -17,6 +18,8 @@ dependencies = [
     "fla-core>=0.4.2",
     "flash-linear-attention>=0.4.2",
     "h5py>=3.16.0",
+    "ipywidgets>=8.1.8",
+    "nbformat>=5.10.4",
 ]
 [tool.uv.sources]
 torch = { index = "pytorch"}
