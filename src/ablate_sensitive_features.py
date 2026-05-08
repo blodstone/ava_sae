@@ -11,7 +11,7 @@ from functools import partial
 import tqdm
 from scipy.stats import wilcoxon
 
-from extract_features import calculate_preference_margin, compute_log_likelihood, extract_layer_number, get_sae_release_id, load_model, load_sae_model
+from extract_features import calculate_preference_margin, compute_log_likelihood, calculate_accuracy,extract_layer_number, get_sae_release_id, load_model, load_sae_model
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 np.random.seed(42)
 torch.manual_seed(42)
@@ -25,15 +25,22 @@ def ablate_features(sae_acts, hook, feature_ids):
     sae_acts[:, :, feature_ids] = 0.0
     return sae_acts
 
-def load_positive_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0) -> np.ndarray:
-    """Return top-k feature indices by descending phi score (positive-phi only)."""
+def load_pos_neg_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0, positive_only: bool = False) -> np.ndarray:
+    """Return top-k feature indices by ascending/descending phi score."""
     data = np.load(phi_path)
-    sorted_phi_idx = data["sorted_phi_idx"]
-    sorted_phi_values = data["sorted_phi_values"]
-    pos_mask = sorted_phi_values > 0
+    # import pdb;pdb.set_trace()
+    
+    if positive_only:
+        sorted_phi_idx = data["sorted_phi_idx"]
+        sorted_phi_values = data["sorted_phi_values"]
+        pos_mask = sorted_phi_values > 0
+    else:
+        sorted_phi_idx = data["sorted_phi_idx"][::-1]
+        sorted_phi_values = data["sorted_phi_values"][::-1]
+        pos_mask = sorted_phi_values < 0
     feature_ids = sorted_phi_idx[pos_mask]
     logging.info(
-        f"Loaded {len(feature_ids)} positive-phi features "
+        f"Loaded {len(feature_ids)} {'positive' if positive_only else 'negative'}-phi features "
         f"(out of {len(sorted_phi_idx)} total) from {phi_path}, using top {top_k}"
     )
     return feature_ids[rank_i: rank_i + top_k]
@@ -130,6 +137,9 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, phi_files, senten
     all_pref_margins_well_formedness = {}
     all_control_pref_margins_constraint_violation = {}
     all_control_pref_margins_well_formedness = {}
+    all_layers_delta_acc_abl_base = []
+    all_layers_delta_acc_random_base = []
+
     for layer_idx, (loglikelihoods_base, loglikelihoods_abl, loglikelihoods_random) in enumerate(zip(
         all_layers_loglikelihoods_base, all_layers_loglikelihoods_abl, all_layers_loglikelihoods_random
     )):
@@ -147,11 +157,24 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, phi_files, senten
         
         pref_margins_well_formedness = calculate_preference_margin(good_avg_loglik_abl, good_avg_loglik_base)
         control_pref_margins_well_formedness = calculate_preference_margin(good_avg_loglik_random, good_avg_loglik_base)
+        
+        pref_margins_abl = calculate_preference_margin(good_avg_loglik_abl, bad_avg_loglik_abl)
+        pref_margins_base = calculate_preference_margin(good_avg_loglik_base, bad_avg_loglik_base)
+        pref_margins_random = calculate_preference_margin(good_avg_loglik_random, bad_avg_loglik_random)
+
+        accuracy_abl = calculate_accuracy(pref_margins_abl)
+        accuracy_base = calculate_accuracy(pref_margins_base)
+        accuracy_random = calculate_accuracy(pref_margins_random)
+
+        delta_acc_abl_base = accuracy_abl - accuracy_base
+        delta_acc_random_base = accuracy_random - accuracy_base
+
         all_pref_margins_constraint_violation[layer_idx] = pref_margins_constraint_violation
         all_pref_margins_well_formedness[layer_idx] = pref_margins_well_formedness
         all_control_pref_margins_constraint_violation[layer_idx] = control_pref_margins_constraint_violation
         all_control_pref_margins_well_formedness[layer_idx] = control_pref_margins_well_formedness
-
+        all_layers_delta_acc_abl_base.append(delta_acc_abl_base)
+        all_layers_delta_acc_random_base.append(delta_acc_random_base)
 
         average_pref_margin_constraint_violation = np.mean(pref_margins_constraint_violation)
         average_pref_margin_well_formedness = np.mean(pref_margins_well_formedness)
@@ -161,39 +184,45 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, phi_files, senten
         average_control_pref_margin_well_formedness = np.mean(control_pref_margins_well_formedness)
         total_control_pref_margins_constraint_violation.append(average_control_pref_margin_constraint_violation)
         total_control_pref_margins_well_formedness.append(average_control_pref_margin_well_formedness)
-    max_total_pref_margin_constraint_violation = max(total_pref_margins_constraint_violation)
-    l_star_total_pref_margin_constraint_violation = total_pref_margins_constraint_violation.index(max_total_pref_margin_constraint_violation)
-    max_total_pref_margin_well_formedness = max(total_pref_margins_well_formedness)
-    l_star_total_pref_margin_well_formedness = total_pref_margins_well_formedness.index(max_total_pref_margin_well_formedness)
-
+    
+    max_delta_acc_abl_base = max(all_layers_delta_acc_abl_base)
+    l_star_delta_acc_abl_base = all_layers_delta_acc_abl_base.index(max_delta_acc_abl_base)
+    
     # "greater": directional hypothesis — ablating bad-sensitive features should raise bad-sentence log-likelihood
     wilcoxon_stat_constraint, wilcoxon_pvalue_constraint = wilcoxon(
-        all_pref_margins_constraint_violation[l_star_total_pref_margin_constraint_violation],
-        all_control_pref_margins_constraint_violation[l_star_total_pref_margin_constraint_violation],
+        all_pref_margins_constraint_violation[l_star_delta_acc_abl_base],
+        all_control_pref_margins_constraint_violation[l_star_delta_acc_abl_base],
         alternative="greater",
     )
     # "two-sided": no directional hypothesis for well-formedness (ablation may help or hurt good sentences)
     wilcoxon_stat_well_formedness, wilcoxon_pvalue_well_formedness = wilcoxon(
-        all_pref_margins_well_formedness[l_star_total_pref_margin_well_formedness],
-        all_control_pref_margins_well_formedness[l_star_total_pref_margin_well_formedness],
+        all_pref_margins_well_formedness[l_star_delta_acc_abl_base],
+        all_control_pref_margins_well_formedness[l_star_delta_acc_abl_base],
         alternative="two-sided",
+    )
+    wilcoxon_stat_delta_acc, wilcoxon_pvalue_delta_acc = wilcoxon(
+        all_layers_delta_acc_abl_base,
+        all_layers_delta_acc_random_base,
+        alternative="greater",
     )
     constraint_significant = wilcoxon_pvalue_constraint < 0.001/len(all_layers_loglikelihoods_base)  # Bonferroni correction for multiple layers
     well_formedness_significant = wilcoxon_pvalue_well_formedness < 0.001/len(all_layers_loglikelihoods_base)  # Bonferroni correction for multiple layers
+    delta_acc_significant = wilcoxon_pvalue_delta_acc < 0.001/len(all_layers_loglikelihoods_base)  # Bonferroni correction for multiple layers
     output_path = output_dir / f"{dataset_name}_summary.txt"
 
     bonferroni_alpha = 0.001 / len(all_layers_loglikelihoods_base)
     with open(output_path, "w") as f:
-        f.write(f"Best layer (constraint violation): {phi_files[l_star_total_pref_margin_constraint_violation].stem}\n")
-        f.write(f"Best layer (well-formedness): {phi_files[l_star_total_pref_margin_well_formedness].stem}\n")
-        f.write(f"Max average preference margin constraint violation (best layer): {max_total_pref_margin_constraint_violation:.6f}\n")
-        f.write(f"Max average preference margin well-formedness (best layer): {max_total_pref_margin_well_formedness:.6f}\n")
+        f.write(f"Best layer (constraint violation): {phi_files[l_star_delta_acc_abl_base].stem}\n")
+        f.write(f"Best layer (well-formedness): {phi_files[l_star_delta_acc_abl_base].stem}\n")
         f.write(f"Wilcoxon signed-rank stat (constraint_violation vs control): {wilcoxon_stat_constraint:.6f}\n")
         f.write(f"Wilcoxon signed-rank p-value (constraint_violation vs control): {wilcoxon_pvalue_constraint:.6e}\n")
         f.write(f"Wilcoxon significant (constraint_violation vs control, alpha={bonferroni_alpha:.6f}): {constraint_significant}\n")
         f.write(f"Wilcoxon signed-rank stat (well_formedness vs control): {wilcoxon_stat_well_formedness:.6f}\n")
         f.write(f"Wilcoxon signed-rank p-value (well_formedness vs control): {wilcoxon_pvalue_well_formedness:.6e}\n")
         f.write(f"Wilcoxon significant (well_formedness vs control, alpha={bonferroni_alpha:.6f}): {well_formedness_significant}\n")
+        f.write(f"Wilcoxon signed-rank stat (delta_acc_abl_base vs delta_acc_random_base): {wilcoxon_stat_delta_acc:.6f}\n")
+        f.write(f"Wilcoxon signed-rank p-value (delta_acc_abl_base vs delta_acc_random_base): {wilcoxon_pvalue_delta_acc:.6e}\n")
+        f.write(f"Wilcoxon significant (delta_acc_abl_base vs delta_acc_random_base, alpha={bonferroni_alpha:.6f}): {delta_acc_significant}\n")
         f.write("\n--- Per-layer results ---\n")
         for layer_idx, phi_file in enumerate(phi_files):
             wstat_c, wpval_c = wilcoxon(
@@ -215,6 +244,12 @@ def save_dataset_evaluation_to_jsonl(output_dir, dataset_name, phi_files, senten
             f.write(f"  Wilcoxon (well-form.): stat={wstat_w:.6f}, p={wpval_w:.6e}, sig={wpval_w < bonferroni_alpha}\n")
     logging.info(
         f"Wilcoxon signed-rank test ({dataset_name}): stat={wilcoxon_stat_constraint:.6f}, p={wilcoxon_pvalue_constraint:.6e}"
+    )
+    logging.info(
+        f"Wilcoxon signed-rank test ({dataset_name}): stat={wilcoxon_stat_well_formedness:.6f}, p={wilcoxon_pvalue_well_formedness:.6e}"
+    )
+    logging.info(
+        f"Wilcoxon signed-rank test ({dataset_name}): stat={wilcoxon_stat_delta_acc:.6f}, p={wilcoxon_pvalue_delta_acc:.6e}"
     )
 
 def main(args):
@@ -253,7 +288,7 @@ def main(args):
     for phi_path in phi_files:
         # Infer sae_id from filename
         sae_id = phi_path.stem
-        feature_ids = load_positive_feature_ids(phi_path, top_k=args.top_k)
+        feature_ids = load_pos_neg_feature_ids(phi_path, top_k=args.top_k, positive_only=args.positive_only)
         log_feature_sentence_distribution(phi_path, feature_ids, n_sentences=args.n_pairs * 2 if args.n_pairs else None, output_dir=output_dir)
         random_feature_ids = load_random_feature_ids(phi_path, top_k=args.top_k, exclude_feature_ids=feature_ids)
         sae = load_sae_model(release, sae_id)
@@ -300,7 +335,7 @@ def run_model_with_ablation(
     logits_abl = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
-        prepend_bos=True,
+        prepend_bos=prepend_bos,
         use_error_term=True,
         fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=feature_ids))],
     )
@@ -308,7 +343,7 @@ def run_model_with_ablation(
     logits_base = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
-        prepend_bos=True,
+        prepend_bos=prepend_bos,
         use_error_term=True,
         fwd_hooks=[],
     )
@@ -316,7 +351,7 @@ def run_model_with_ablation(
     logits_random = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
-        prepend_bos=True,
+        prepend_bos=prepend_bos,
         use_error_term=True,
         fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=random_feature_ids))],
     )
@@ -352,6 +387,7 @@ if __name__ == '__main__':
         "--output_dir", type=Path,
         default=PROJECT_ROOT / "output" / "features",
     )
+    parser.add_argument("--positive_only", action="store_true", help="Only ablate features with positive phi.")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
         "--n_pairs", type=int, default=None,
