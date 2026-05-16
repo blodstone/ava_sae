@@ -49,8 +49,8 @@ def compute_log_likelihood(logits, input_ids, attention_mask):
     
     # Aggregate log-likelihoods
     sent_loglik = token_logp.sum(dim=1)   # [B]
-    batch_avg_sent_loglik = sent_loglik / attention_mask[:, 1:].sum(dim=1)  # [B]: average loglik per token (excluding padding and BOS)
-    return batch_avg_sent_loglik
+    # batch_avg_sent_loglik = sent_loglik / attention_mask[:, 1:].sum(dim=1)  # [B]: average loglik per token
+    return sent_loglik
 
 def run_model_with_targeted_cache(model, model_name, sae, sae_id, sampled_sentences, prepend_bos=True):
     with torch.no_grad():
@@ -108,7 +108,7 @@ def extract_layer_number(layer_str: str) -> int:
 
     raise ValueError(f"Could not extract layer number from: {layer_str!r}")
 
-def get_sae_release_id(model_name) -> tuple[str, list]:
+def get_sae_release_id(model_name, width=262, l0='big') -> tuple[str, list]:
     # Map model names to SAE release IDs
     mapping_release = {
         "gpt2": "gpt2-small-res-jb",
@@ -123,12 +123,11 @@ def get_sae_release_id(model_name) -> tuple[str, list]:
     }   
     
     mapping_sae_id = {
-        "gpt2": [f"blocks.{i}.hook_resid_pre" for i in range(12)],
-        "google/gemma-3-270m": [f"layer_{str(i)}_width_262k_l0_big" for i in [5,9,12,15]],
-        "google/gemma-3-1b-pt": [f"layer_{str(i)}_width_262k_l0_big" for i in [7,13,17,22]],
-        "google/gemma-3-4b-pt": [f"layer_{str(i)}_width_262k_l0_big" for i in [9,17,22,29]],
-        "google/gemma-3-12b-pt": [f"layer_{str(i)}_width_262k_l0_big" for i in [12,24,31,41]],
-        "google/gemma-3-27b-pt": [f"layer_{str(i)}_width_262k_l0_big" for i in [16,31,40,53]],
+        "gpt2": [f"blocks.{i}.hook_resid_pre" for i in [2, 5, 7, 10]],
+        "google/gemma-3-270m": [f"layer_{str(i)}_{width}_262k_{l0}_big" for i in [5,9,12,15]],
+        "google/gemma-3-1b-pt": [f"layer_{str(i)}_{width}_262k_{l0}_big" for i in [7,13,17,22]],
+        "google/gemma-3-4b-pt": [f"layer_{str(i)}_{width}_262k_{l0}_big" for i in [9,17,22,29]],
+        "google/gemma-3-12b-pt": [f"layer_{str(i)}_{width}_262k_{l0}_big" for i in [12,24,31,41]],
         "Qwen/Qwen3.5-2B": [f"layer{i}" for i in [6, 12, 16, 20]],
         "Qwen/Qwen3.5-9B": [f"layer{i}" for i in [8, 16, 21, 27]],
     }
@@ -278,6 +277,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default='gpt2')
+    parser.add_argument("--width", type=int, default=262, help="Width of the Gemma SAE features to extract (e.g., 262 for 262k features).")
+    parser.add_argument("--l0", type=str, default="big", help="L0 of the Gemma SAE features to extract (e.g., 'big' for big features).")
     parser.add_argument('--dataset_name', type=str, default='blimp')
     parser.add_argument('--dataset_path', type=Path, default=PROJECT_ROOT / "data" / "input_data" / "blimp_data.jsonl")
     parser.add_argument('--batch_size', type=int, default=32)

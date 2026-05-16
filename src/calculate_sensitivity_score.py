@@ -3,7 +3,7 @@ import argparse
 import tqdm
 from pathlib import Path
 from typing import Any, cast
-
+import json
 import h5py
 import numpy as np
 
@@ -48,29 +48,33 @@ def _read_sentence_sparse(h5f: h5py.File, sent_idx: int):
 
 def compute_phi_l(
     h5f: h5py.File,
+    sampled_sentences: list[str],
+    linguistic_terms_map: dict[str, int],
     sentence_indices: list[int],
     n_features: int,
     lambda_: float = 1.0
-) -> np.ndarray:
+) -> tuple[np.ndarray, dict[str, Any]]:
     if len(sentence_indices) % 2 != 0:
         raise ValueError("sentence_indices must contain an even number of entries (good/bad pairs).")
-
+    n_linguistic_terms = len(linguistic_terms_map) 
     n_pairs = len(sentence_indices) // 2
-    phi_sum = np.zeros(n_features, dtype=np.float64)
+    phi_sum = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
     total_tokens = 0
 
     # Track pair-level counts for correct distribution reporting
-    bad_only_pair_count = np.zeros(n_features, dtype=np.int32)   # bad but not good (φ-eligible)
-    good_only_pair_count = np.zeros(n_features, dtype=np.int32)  # good but not bad
-    both_pair_count = np.zeros(n_features, dtype=np.int32)       # both good and bad
+    bad_only_pair_count = np.zeros((n_linguistic_terms, n_features), dtype=np.int32)   # bad but not good (φ-eligible)
+    good_only_pair_count = np.zeros((n_linguistic_terms, n_features), dtype=np.int32)  # good but not bad
+    both_pair_count = np.zeros((n_linguistic_terms, n_features), dtype=np.int32)       # both good and bad
 
-    for pos in tqdm.tqdm(range(0, len(sentence_indices), 2)):
-        good_idx = sentence_indices[pos]
-        bad_idx = sentence_indices[pos + 1]
-
+    for idx in tqdm.tqdm(range(0, len(sampled_sentences), 2), desc="Processing sentence pairs"):
+        linguistic_term, global_idx = sampled_sentences[idx]  
+        linguistic_term_index = linguistic_terms_map[linguistic_term]
+        good_idx = sentence_indices[global_idx]
+        bad_idx = sentence_indices[global_idx + 1]
+        import pdb;pdb.set_trace()
         good_sent_data = _read_sentence_sparse(h5f, good_idx)
         bad_sent_data = _read_sentence_sparse(h5f, bad_idx)
-
+        
         t = min(len(good_sent_data["tokens"]), len(bad_sent_data["tokens"]))
         # if t == 0:
         #     continue
@@ -86,13 +90,13 @@ def compute_phi_l(
         good_only = good_feat_set - bad_feat_set
         both      = good_feat_set & bad_feat_set
 
-        np.add.at(bad_only_pair_count,  list(bad_only),  1)
-        np.add.at(good_only_pair_count, list(good_only), 1)
-        np.add.at(both_pair_count,      list(both),      1)
+        np.add.at(bad_only_pair_count,  (linguistic_term_index, list(bad_only)),  1)
+        np.add.at(good_only_pair_count, (linguistic_term_index, list(good_only)), 1)
+        np.add.at(both_pair_count,      (linguistic_term_index, list(both)),      1)
 
         # φ accumulation (unchanged)
-        np.add.at(phi_sum, bad_sent_data['feature_idx'], bad_sent_data['feature_values'].astype(np.float64))
-        np.add.at(phi_sum, good_sent_data['feature_idx'], -good_sent_data['feature_values'].astype(np.float64))
+        np.add.at(phi_sum, (linguistic_term_index, bad_sent_data['feature_idx']), bad_sent_data['feature_values'].astype(np.float64))
+        np.add.at(phi_sum, (linguistic_term_index, good_sent_data['feature_idx']), -good_sent_data['feature_values'].astype(np.float64))
 
 
         total_tokens += t
@@ -107,23 +111,20 @@ def compute_phi_l(
         "n_pairs":         n_pairs,
     }
 
-    print("Distribution of feature presence across good/bad pairs:")
+    distribution_lines = ["Distribution of feature presence across good/bad pairs:"]
     for category, counts in distribution.items():
         if category != "n_pairs":
-            print(f"  {category}: {np.sum(counts)} features (mean {np.mean(counts):.2f} pairs/feature)")
+            distribution_lines.append(
+                f"  {category}: {np.sum(counts)} features (mean {np.mean(counts):.2f} pairs/feature)"
+            )
         else:
-            print(f"  {category}: {counts}")
-    # both_threshold = max(1, int(0.02 * n_pairs))  # e.g. 20 pairs out of 1000
-    # both_mask = both_pair_count > both_threshold
-    # phi_sum[both_mask] = 0.0
+            distribution_lines.append(f"  {category}: {counts}")
+    distribution["summary_text"] = "\n".join(distribution_lines)
     
-    # logging.info(
-    #     f"Zeroed out {both_mask.sum()} features that appeared in both "
-    #     f"good and bad sentences (both_pair_count > {both_threshold})."
-    # )
-    return (phi_sum / float(total_tokens)).astype(np.float32)
+    phi_l = (phi_sum / float(total_tokens)).astype(np.float32)
+    return phi_l, distribution
 
-def _process_one(h5_path: Path, out_path: Path, sentence_idx, start_idx: int, end_idx, lambda_: float = 1.0) -> None:
+def _process_one(h5_path: Path, sampled_sentences: list[str], linguistic_terms_map: dict[str, int], out_path: Path, sentence_idx, start_idx: int, end_idx, lambda_: float = 1.0) -> None:
     with h5py.File(h5_path, "r") as h5f:
         ds_offsets = cast(h5py.Dataset, h5f["offsets"])
         n_features = cast(int, h5f.attrs.get("n_features", 0))
@@ -134,37 +135,62 @@ def _process_one(h5_path: Path, out_path: Path, sentence_idx, start_idx: int, en
             start_idx=start_idx,
             end_idx=end_idx,
         )
-        phi_l = compute_phi_l(h5f, sentence_indices=sentence_indices, n_features=n_features, lambda_=lambda_)
+        phi_l, distribution = compute_phi_l(h5f, sampled_sentences=sampled_sentences, linguistic_terms_map=linguistic_terms_map, sentence_indices=sentence_indices, n_features=n_features, lambda_=lambda_)
 
-    sorted_phi_idx = np.argsort(phi_l)[::-1]
-    sorted_phi_values = phi_l[sorted_phi_idx]
+    sorted_phi_idx = np.argsort(phi_l, axis=1)[:, ::-1]
+    sorted_phi_values = np.take_along_axis(phi_l, sorted_phi_idx, axis=1)   
     np.savez_compressed(
         out_path,
         sorted_phi_idx=sorted_phi_idx,
         sorted_phi_values=sorted_phi_values,
     )
 
+    distribution_txt_path = out_path.with_name(f"{out_path.stem}_distribution.txt")
+    distribution_txt_path.write_text(cast(str, distribution["summary_text"]) + "\n", encoding="utf-8")
+
 
 def main(args):
+    
+    with open(args.dataset_path) as f:
+        data = [json.loads(line) for line in f]
+
+    sampled_sentences = []
+    linguistic_terms_set = set()
+    for dataline in data:
+        sampled_sentences.append((dataline[0]["linguistics_term"], dataline[0]['global_idx']))  # Extract linguistic phenomenon
+        sampled_sentences.append((dataline[1]["linguistics_term"], dataline[1]['global_idx']))  # Extract linguistic phenomenon
+        linguistic_terms_set.add(dataline[0]["linguistics_term"])
+        linguistic_terms_set.add(dataline[1]["linguistics_term"])
+    # Create a mapping from linguistic terms to indices
+    
+    linguistic_terms_map = {term: i for i, term in enumerate(sorted(linguistic_terms_set))}
+
     if args.h5_dir is not None:
         h5_files = sorted(args.h5_dir.glob("*.h5"))
         if not h5_files:
             raise FileNotFoundError(f"No .h5 files found in {args.h5_dir}")
         for h5_path in h5_files:
-            out_path = h5_path.with_suffix(".npz")
-            import logging
-            logging.info(f"Processing {h5_path.name} -> {out_path.name}")
-            _process_one(h5_path, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.lambda_)
+            out_dir = h5_path.parent / args.split_name
+            out_dir.mkdir(exist_ok=True)
+            out_path = out_dir / h5_path.name.replace(".h5", ".npz")
+            logging.info(f"Split: {args.split_name}, Processing {h5_path.name} -> {out_path.name}")
+            _process_one(h5_path, sampled_sentences, linguistic_terms_map, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.lambda_)
     else:
         if args.h5_path is None:
             raise ValueError("Provide either --h5_path or --h5_dir.")
         out_path = args.out_path if args.out_path is not None else args.h5_path.with_suffix(".npz")
-        _process_one(args.h5_path, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.lambda_)
+        _process_one(args.h5_path, sampled_sentences, linguistic_terms_map, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.lambda_)
 
 
 if __name__ == '__main__':
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     parser = argparse.ArgumentParser(description="Compute SAE sensitivity score Phi from sparse HDF5 features.")
+    parser.add_argument(
+        "--dataset_path", type=Path,
+        default=PROJECT_ROOT / "data" / "input_data" / "blimp_data.jsonl",
+    )
+    parser.add_argument("--split_name", type=str, default="valid", help="Which BLiMP split to use (e.g., 'valid', 'test').")
     parser.add_argument("--h5_path", type=Path, default=None, help="Path to one SAE layer .h5 file.")
     parser.add_argument("--h5_dir", type=Path, default=None, help="Directory of .h5 files; processes all and saves .npz alongside each.")
     parser.add_argument("--out_path", type=Path, default=None, help="Output .npz path (single-file mode only). Defaults to h5_path with .npz extension.")
