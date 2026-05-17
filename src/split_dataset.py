@@ -9,9 +9,12 @@ def main(args):
     with open(args.dataset_path, "r") as f:
         data = [json.loads(line) for line in f]
     paradigm_map = {}
-    for idx, item in enumerate(data):
+    idx = 0
+    for item in data:
         item[0]['global_idx'] = idx
+        idx += 1
         item[1]['global_idx'] = idx
+        idx += 1
         paradigm = item[0]['id'].split('#')[0]
         if paradigm not in paradigm_map:
             paradigm_map[paradigm] = []
