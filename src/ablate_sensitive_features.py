@@ -419,7 +419,6 @@ def run_model_with_ablation(
         hook_block_name = f'blocks.{layer_number}.hook_out.hook_sae_acts_post'
     input_ids = model.to_tokens(sampled_sentences, prepend_bos=prepend_bos)
     masks, _ = make_blimp_prefix_mask(input_ids)
-    import pdb; pdb.set_trace()
     attention_mask = (input_ids != pad_id).long() * masks.long()  # shape: (B, L)
     # ---- ablated pass ------------------------------------------------
     logits_abl = model.run_with_hooks_with_saes(
