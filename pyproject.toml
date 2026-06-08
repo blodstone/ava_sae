@@ -1,15 +1,15 @@
 [project]
 name = "ava-sae"
 version = "0.1.0"
+requires-python = ">=3.11"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
 dependencies = [
     "requests>=2.32.2",
     "datasets>=3.1.0",
-    "sae-lens>=6.37.4",
+    "sae-lens>=6.43.0",
+    "transformer-lens>=3.0.0",
     "torch>=2.10.0",
-    "ipykernel",
     "matplotlib>=3.10.8",
     "sae-vis>=0.2.15",
     "transformers==5.4.0",
@@ -17,6 +17,13 @@ dependencies = [
     "sentencepiece>=0.2.1",
     "fla-core>=0.4.2",
     "flash-linear-attention>=0.4.2",
+    "h5py>=3.16.0",
+    "ipywidgets>=8.1.8",
+    "nbformat>=5.10.4",
+    "optuna>=4.8.0",
+    "torchvision>=0.26.0",
+    "python-docx>=1.2.0",
+    "pypdf>=6.11.0",
 ]
 [tool.uv.sources]
 torch = { index = "pytorch"}
@@ -24,6 +31,11 @@ torch = { index = "pytorch"}
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu130"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+]
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
