@@ -12,28 +12,73 @@ import tqdm
 from scipy.stats import wilcoxon
 
 from extract_features import calculate_preference_margin, compute_log_likelihood, calculate_accuracy,extract_layer_number, get_sae_release_id, load_model, load_sae_model
+from util.blimp_util import make_blimp_prefix_mask
 
 
-def ablate_features(sae_acts, hook, feature_ids):
-    sae_acts[:, :, feature_ids] = 0.0
+def ablate_features(sae_acts, hook, feature_ids, feature_values, attention_mask, is_control=False):
+    feature_ids = torch.as_tensor(feature_ids, device=sae_acts.device)
+    feature_values = torch.as_tensor(feature_values, device=sae_acts.device)
+    good = sae_acts[0::2]   # shape: (n_pairs, seq, hidden)
+    bad  = sae_acts[1::2]
+    attention_mask = attention_mask[0::2]  # shape: (n_pairs, seq)
+    good_feats = good[:, :, feature_ids] # reranking features by phi rank, shape: (n_pairs, seq, n_features)
+    bad_feats  = bad[:, :, feature_ids]
+
+    active_mask = (bad_feats != 0) & (good_feats == 0)
+    
+    active_mask = active_mask & attention_mask.unsqueeze(-1)  # only consider active features at attended positions
+
+    if not is_control:
+        selected_idx = active_mask.float().topk(1, dim=-1).indices
+    else:
+        n_pairs, seq, n_feats = active_mask.shape
+        flat = active_mask.float().view(-1, n_feats)          # (n_pairs*seq, n_features)
+
+        n_active = flat.sum(dim=-1).min().item()
+        k = max(1, min(1, int(n_active)))
+
+        selected_idx = ((flat + 1e-10)                            # epsilon avoids all-zero rows
+                    .multinomial(k, replacement=False)       # (n_pairs*seq, k)
+                    .view(n_pairs, seq, k))                  # (n_pairs, seq, k)
+    actual_idx = feature_ids[selected_idx]
+
+    bad_vals = bad.gather(dim=2, index=actual_idx)     # Shape: (8, 7, 1)
+    good_vals = good.gather(dim=2, index=actual_idx)   # Shape: (8, 7, 1)
+
+    mask_at_idx = (bad_vals != 0) & (good_vals == 0)
+
+    mask_at_idx = mask_at_idx & attention_mask.unsqueeze(-1).bool()
+
+    b_coords, seq_coords, _ = torch.where(mask_at_idx)
+
+
+    valid_targets = actual_idx[b_coords, seq_coords, 0]
+
+    # mode_seq = seq_coords.mode().values
+    # mask = seq_coords == mode_seq
+    # b_coords = b_coords[mask]
+    # seq_coords = seq_coords[mask]
+    # valid_targets = valid_targets[mask]
+    # import pdb; pdb.set_trace()
+    bad[b_coords, seq_coords, valid_targets] = 0
+
     return sae_acts
 
-def load_pos_neg_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0, positive_only: bool = False) -> np.ndarray:
+def load_pos_neg_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0, positive_only: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Return top-k feature indices by ascending/descending phi score."""
     data = np.load(phi_path)
-    
     if positive_only:
         sorted_phi_idx = data["sorted_phi_idx"].copy()
+        sorted_phi_values = data["sorted_phi_values"].copy()
     else:
         sorted_phi_idx = data["sorted_phi_idx"][:, ::-1].copy()
-
-    import pdb;pdb.set_trace()
-    feature_ids = sorted_phi_idx[:, rank_i: rank_i + top_k]
-    logging.info(
-        f"Loaded {len(feature_ids)} {'positive' if positive_only else 'negative'}-phi features "
-        f"(out of {len(sorted_phi_idx)} total) from {phi_path}, using top {top_k}"
-    )
-    return feature_ids
+        sorted_phi_values = data["sorted_phi_values"][:, ::-1].copy()
+    # feature_ids = sorted_phi_idx[:, rank_i: rank_i + top_k]
+    # logging.info(
+    #     f"Loaded {len(feature_ids)} {'positive' if positive_only else 'negative'}-phi features "
+    #     f"(out of {len(sorted_phi_idx)} total) from {phi_path}, using top {top_k}"
+    # )
+    return (sorted_phi_idx, sorted_phi_values)
 
 def log_feature_sentence_distribution(
     phi_path: Path,
@@ -116,7 +161,7 @@ def log_feature_sentence_distribution(
         all_lines.append("")
 
     text = "\n".join(all_lines)
-    logging.info(text)
+    # logging.info(text)
     if output_dir is not None:
         out_path = output_dir / f"{phi_path.stem}_feature_distribution.txt"
         out_path.write_text(text + "\n")
@@ -187,14 +232,12 @@ def save_dataset_evaluation_to_jsonl(output_dir, model_name, dataset_name, save_
             good_base   = base[0::2];   bad_base   = base[1::2]
             good_abl    = abl[0::2];    bad_abl    = abl[1::2]
             good_random = random_[0::2]; bad_random = random_[1::2]
-
             pref_cv  = calculate_preference_margin(bad_abl,    bad_base)
             ctrl_cv  = calculate_preference_margin(bad_random, bad_base)
             pref_wf  = calculate_preference_margin(good_abl,    good_base)
             ctrl_wf  = calculate_preference_margin(good_random, good_base)
             pref_sel = calculate_preference_margin(bad_abl, good_abl)
             ctrl_sel = calculate_preference_margin(bad_random, good_random)
-
             acc_abl    = calculate_accuracy(calculate_preference_margin(good_abl,    bad_abl))
             acc_base   = calculate_accuracy(calculate_preference_margin(good_base,   bad_base))
             acc_random = calculate_accuracy(calculate_preference_margin(good_random, bad_random))
@@ -218,9 +261,16 @@ def save_dataset_evaluation_to_jsonl(output_dir, model_name, dataset_name, save_
         l_star = delta_acc_abl_layers.index(min_delta_acc)
         all_terms_max_delta_acc.append(min_delta_acc)
         
-        wstat_c, wpval_c = wilcoxon(all_pref_margins_cv[l_star], all_ctrl_margins_cv[l_star], alternative="greater")
-        wstat_w, wpval_w = wilcoxon(all_pref_margins_wf[l_star], all_ctrl_margins_wf[l_star], alternative="two-sided")
-        wstat_s, wpval_s = wilcoxon(all_sel_margins_cv[l_star], all_sel_margins_wf[l_star], alternative="greater")
+        try:
+            wstat_c, wpval_c = wilcoxon(all_pref_margins_cv[l_star], all_ctrl_margins_cv[l_star], alternative="greater")
+            wstat_w, wpval_w = wilcoxon(all_pref_margins_wf[l_star], all_ctrl_margins_wf[l_star], alternative="two-sided")
+            wstat_s, wpval_s = wilcoxon(all_sel_margins_cv[l_star], all_sel_margins_wf[l_star], alternative="greater")
+        except:
+            logging.warning(f"Error occurred while performing Wilcoxon test for term '{term}', setting p-values to NaN.")
+            wstat_c, wpval_c = np.nan, np.nan
+            wstat_w, wpval_w = np.nan, np.nan
+            wstat_s, wpval_s = np.nan, np.nan
+
         if np.all(np.array(delta_acc_abl_layers) == np.array(delta_acc_random_layers)):
             logging.warning(f"Delta accuracy values are identical for abl and random layers for term '{term}', cannot perform Wilcoxon test; setting p-value to NaN.")
             wstat_d, wpval_d = np.nan, np.nan
@@ -236,9 +286,15 @@ def save_dataset_evaluation_to_jsonl(output_dir, model_name, dataset_name, save_
         output_lines.append(f"Wilcoxon (delta_acc,    alpha={bonferroni_alpha:.6f}): stat={wstat_d:.6f}, p={wpval_d:.6e}, sig={wpval_d < bonferroni_alpha}")
         output_lines.append("  Layer                           avg_pref_cv  avg_pref_wf  avg_ctrl_cv  avg_ctrl_wf  avg_sel_cv   avg_sel_wf   Wcv_p       Www_p       Wsel_p      delta_acc_abl  delta_acc_rnd  cv>0  wf~0  sel>0" )
         for layer_idx in range(n_layers):
-            wcl, wpl = wilcoxon(all_pref_margins_cv[layer_idx], all_ctrl_margins_cv[layer_idx], alternative="greater")
-            wwl, wpl_w = wilcoxon(all_pref_margins_wf[layer_idx], all_ctrl_margins_wf[layer_idx], alternative="two-sided")
-            wsl, wpl_s = wilcoxon(all_sel_margins_cv[layer_idx], all_sel_margins_wf[layer_idx], alternative="greater")
+            try:
+                wcl, wpl = wilcoxon(all_pref_margins_cv[layer_idx], all_ctrl_margins_cv[layer_idx], alternative="greater")
+                wwl, wpl_w = wilcoxon(all_pref_margins_wf[layer_idx], all_ctrl_margins_wf[layer_idx], alternative="two-sided")
+                wsl, wpl_s = wilcoxon(all_sel_margins_cv[layer_idx], all_sel_margins_wf[layer_idx], alternative="greater")
+            except:
+                logging.warning(f"Error occurred while performing Wilcoxon test for layer {layer_idx}, setting p-values to NaN.")
+                wcl, wpl = np.nan, np.nan
+                wwl, wpl_w = np.nan, np.nan
+                wsl, wpl_s = np.nan, np.nan
             cv_pass = "YES" if avg_pref_cv_layers[layer_idx] > 0 else "NO"
             wf_pass = "YES" if abs(avg_pref_wf_layers[layer_idx]) <= 0.05 else "NO"
             sel_pass = "YES" if avg_sel_cv_layers[layer_idx] > 0 else "NO"
@@ -314,10 +370,9 @@ def main(args):
     for phi_path in phi_files:
         # Infer sae_id from filename
         sae_id = phi_path.stem
-        import pdb;pdb.set_trace()
         feature_ids = load_pos_neg_feature_ids(phi_path, top_k=args.top_k, rank_i=args.rank_i, positive_only=args.positive_only)
-        log_feature_sentence_distribution(args.phi_dir / phi_path.name, feature_ids, n_sentences=args.n_pairs * 2 if args.n_pairs else None, output_dir=output_dir, linguistic_terms_map=linguistic_terms_map)
-        random_feature_ids = load_random_feature_ids(phi_path, top_k=args.top_k, exclude_feature_ids=feature_ids)
+        log_feature_sentence_distribution(args.phi_dir / phi_path.name, feature_ids[0], n_sentences=args.n_pairs * 2 if args.n_pairs else None, output_dir=output_dir, linguistic_terms_map=linguistic_terms_map)
+        random_feature_ids = load_random_feature_ids(phi_path, top_k=args.top_k, exclude_feature_ids=feature_ids[0])
         sae = load_sae_model(release, sae_id)
         # Collect log-likelihoods per linguistic term for this layer
         layer_loglik_abl    = {term: [] for term in sampled_sentences}
@@ -326,10 +381,11 @@ def main(args):
         for linguistic_term, sentences in tqdm.tqdm(sampled_sentences.items(), desc=f"{sae_id} terms", leave=False):
             for i in range(0, len(sentences), batch_size):
                 batch_sentences = sentences[i:i+batch_size]
-                feature_ids_batch = feature_ids[linguistic_terms_map[linguistic_term]]
+                feature_ids_batch = feature_ids[0][linguistic_terms_map[linguistic_term]]
+                feature_values_batch = feature_ids[1][linguistic_terms_map[linguistic_term]]
                 random_feature_ids_batch = random_feature_ids[linguistic_terms_map[linguistic_term]]
                 batch_avg_sent_loglik_abl, batch_avg_sent_loglik_base, batch_avg_sent_loglik_random = run_model_with_ablation(
-                    model, args.model_name, sae, sae_id, feature_ids_batch, random_feature_ids_batch, batch_sentences
+                    model, args.model_name, sae, sae_id, feature_ids_batch, feature_values_batch, random_feature_ids_batch, batch_sentences
                 )
                 layer_loglik_abl[linguistic_term].extend(batch_avg_sent_loglik_abl.tolist())
                 layer_loglik_base[linguistic_term].extend(batch_avg_sent_loglik_base.tolist())
@@ -348,6 +404,7 @@ def run_model_with_ablation(
     sae: SAE,
     sae_id: str,
     feature_ids: np.ndarray,
+    feature_values: np.ndarray,
     random_feature_ids: np.ndarray,
     sampled_sentences: list[str],
     prepend_bos: bool = True,
@@ -355,21 +412,25 @@ def run_model_with_ablation(
     layer_number = extract_layer_number(sae_id)
     if 'gpt2' in model_name:
         # GPT 2 specifics
+        pad_id = model.tokenizer.eos_token_id
         hook_block_name = f'blocks.{layer_number}.hook_in.hook_sae_acts_post'
     else:
+        pad_id = model.tokenizer.pad_token_id
         hook_block_name = f'blocks.{layer_number}.hook_out.hook_sae_acts_post'
-
     input_ids = model.to_tokens(sampled_sentences, prepend_bos=prepend_bos)
-    pad_id = model.tokenizer.pad_token_id or model.tokenizer.eos_token_id
-    attention_mask = (input_ids != pad_id).long()
+    masks, _ = make_blimp_prefix_mask(input_ids)
+    import pdb; pdb.set_trace()
+    attention_mask = (input_ids != pad_id).long() * masks.long()  # shape: (B, L)
     # ---- ablated pass ------------------------------------------------
     logits_abl = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
         prepend_bos=prepend_bos,
         use_error_term=True,
-        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=feature_ids))],
+        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=feature_ids, feature_values=feature_values, attention_mask=attention_mask))],
     )
+    model.reset_saes()
+    model.reset_hooks()
     # ---- baseline pass (SAE active, no features ablated) -------------
     logits_base = model.run_with_hooks_with_saes(
         sampled_sentences,
@@ -378,13 +439,15 @@ def run_model_with_ablation(
         use_error_term=True,
         fwd_hooks=[],
     )
+    model.reset_saes()
+    model.reset_hooks()
     # ---- random pass ------------------------------------------------
     logits_random = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
         prepend_bos=prepend_bos,
         use_error_term=True,
-        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=random_feature_ids))],
+        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=feature_ids, feature_values=feature_values, attention_mask=attention_mask, is_control=True))],
     )
 
     batch_avg_sent_loglik_abl = compute_log_likelihood(logits_abl, input_ids, attention_mask)
