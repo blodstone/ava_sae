@@ -1,3 +1,4 @@
+import random
 import argparse
 import json
 import logging
@@ -11,74 +12,128 @@ from functools import partial
 import tqdm
 from scipy.stats import wilcoxon
 
-from extract_features import calculate_preference_margin, compute_log_likelihood, calculate_accuracy,extract_layer_number, get_sae_release_id, load_model, load_sae_model
+from extract_features import calculate_accuracy, calculate_preference_margin, compute_log_likelihood, extract_layer_number, extract_layer_number, get_sae_release_id, load_model, load_sae_model
 from util.blimp_util import make_blimp_prefix_mask
 
 
-def ablate_features(sae_acts, hook, feature_ids, feature_values, attention_mask, is_control=False):
-    feature_ids = torch.as_tensor(feature_ids, device=sae_acts.device)
-    feature_values = torch.as_tensor(feature_values, device=sae_acts.device)
-    good = sae_acts[0::2]   # shape: (n_pairs, seq, hidden)
-    bad  = sae_acts[1::2]
-    attention_mask = attention_mask[0::2]  # shape: (n_pairs, seq)
-    good_feats = good[:, :, feature_ids] # reranking features by phi rank, shape: (n_pairs, seq, n_features)
-    bad_feats  = bad[:, :, feature_ids]
+def ablate_top_k_active_phi(
+    sae_acts, hook,
+    phi_scores: torch.Tensor,
+    top_k: int,
+    attention_mask: torch.Tensor,
+    divergence_indices: torch.Tensor,
+    stats_sink: list[dict] | None = None,
+):
+    """Ablate the top-k φ-ranked features that are active at or after the divergence token.
 
-    active_mask = (bad_feats != 0) & (good_feats == 0)
-    
-    active_mask = active_mask & attention_mask.unsqueeze(-1)  # only consider active features at attended positions
+    sae_acts:          [batch, seq, n_features]
+    phi_scores:        [n_features] — higher = more discriminative for this term
+    attention_mask:    [batch, seq] — 1 for real tokens, 0 for padding
+    divergence_indices:[batch]      — first token position where good/bad sentences differ
+    """
+    seq_len = sae_acts.shape[1]
+    time_steps = torch.arange(seq_len, device=sae_acts.device).unsqueeze(0)  # [1, seq]
+    # Temporal mask: True for t >= divergence_index AND real (non-padding) token
+    temporal_mask = (time_steps >= divergence_indices.unsqueeze(1)) & attention_mask.bool()  # [batch, seq]
+    # Determine active features only within the violation window
+    post_violation_acts = sae_acts * temporal_mask.unsqueeze(-1)   # [batch, seq, n_features]
+    active = post_violation_acts.abs().sum(dim=1) > 0              # [batch, n_features]
+    # Restrict further to features with φ > 0
+    masked_phi = phi_scores.unsqueeze(0).expand(sae_acts.shape[0], -1).clone()  # [batch, n_features]
+    masked_phi[~active | (masked_phi <= 0)] = float('-inf')
+    eligible_counts = (active & (phi_scores.unsqueeze(0) > 0)).sum(dim=1)        # [batch]
+    k = min(top_k, sae_acts.shape[2])
+    top_vals, top_indices = torch.topk(masked_phi, k=k, dim=1)     # [batch, k]
+    valid = top_vals > float('-inf')                                # [batch, k]
+    ablated_counts = valid.sum(dim=1)                               # [batch]
+    if stats_sink is not None:
+        stats_sink.append({
+            "batch_size": int(sae_acts.shape[0]),
+            "eligible_total": int(eligible_counts.sum().item()),
+            "ablated_total": int(ablated_counts.sum().item()),
+            "eligible_per_sample": eligible_counts.detach().cpu().tolist(),
+            "ablated_per_sample": ablated_counts.detach().cpu().tolist(),
+        })
+    if not valid.any():
+        return sae_acts
+    sae_acts_cloned = sae_acts.clone()
+    # Build boolean mask [batch, seq, n_features]: True where we zero
+    idx_exp      = top_indices.unsqueeze(1).expand(-1, seq_len, -1)           # [batch, seq, k]
+    valid_exp    = valid.unsqueeze(1).expand(-1, seq_len, -1)                 # [batch, seq, k]
+    temporal_exp = temporal_mask.unsqueeze(-1).expand(-1, -1, k)              # [batch, seq, k]
+    feature_mask = torch.zeros_like(sae_acts_cloned, dtype=torch.bool)
+    feature_mask.scatter_(2, idx_exp, valid_exp & temporal_exp)
+    sae_acts_cloned[feature_mask] = 0.0
+    return sae_acts_cloned
 
-    if not is_control:
-        selected_idx = active_mask.float().topk(1, dim=-1).indices
-    else:
-        n_pairs, seq, n_feats = active_mask.shape
-        flat = active_mask.float().view(-1, n_feats)          # (n_pairs*seq, n_features)
 
-        n_active = flat.sum(dim=-1).min().item()
-        k = max(1, min(1, int(n_active)))
+def ablate_random_active(
+    sae_acts, hook,
+    top_k: int,
+    attention_mask: torch.Tensor,
+    divergence_indices: torch.Tensor,
+):
+    """Ablate top-k randomly chosen features that are active at or after the divergence token."""
+    seq_len = sae_acts.shape[1]
+    time_steps = torch.arange(seq_len, device=sae_acts.device).unsqueeze(0)
+    temporal_mask = (time_steps >= divergence_indices.unsqueeze(1)) & attention_mask.bool()  # [batch, seq]
+    post_violation_acts = sae_acts * temporal_mask.unsqueeze(-1)
+    active = post_violation_acts.abs().sum(dim=1) > 0              # [batch, n_features]
+    rand_scores = torch.rand(sae_acts.shape[0], sae_acts.shape[2], device=sae_acts.device)
+    rand_scores[~active] = float('-inf')
+    k = min(top_k, sae_acts.shape[2])
+    top_vals, chosen = torch.topk(rand_scores, k=k, dim=1)         # [batch, k]
+    valid = top_vals > float('-inf')
+    if not valid.any():
+        return sae_acts
+    sae_acts_cloned = sae_acts.clone()
+    idx_exp      = chosen.unsqueeze(1).expand(-1, seq_len, -1)
+    valid_exp    = valid.unsqueeze(1).expand(-1, seq_len, -1)
+    temporal_exp = temporal_mask.unsqueeze(-1).expand(-1, -1, k)
+    feature_mask = torch.zeros_like(sae_acts_cloned, dtype=torch.bool)
+    feature_mask.scatter_(2, idx_exp, valid_exp & temporal_exp)
+    sae_acts_cloned[feature_mask] = 0.0
+    return sae_acts_cloned
 
-        selected_idx = ((flat + 1e-10)                            # epsilon avoids all-zero rows
-                    .multinomial(k, replacement=False)       # (n_pairs*seq, k)
-                    .view(n_pairs, seq, k))                  # (n_pairs, seq, k)
-    actual_idx = feature_ids[selected_idx]
+def load_positive_feature_ids(
+    phi_path: Path, top_k: int = 10, rank_i: int = 0
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Return top-k positive-φ feature indices and values per linguistic term.
 
-    bad_vals = bad.gather(dim=2, index=actual_idx)     # Shape: (8, 7, 1)
-    good_vals = good.gather(dim=2, index=actual_idx)   # Shape: (8, 7, 1)
-
-    mask_at_idx = (bad_vals != 0) & (good_vals == 0)
-
-    mask_at_idx = mask_at_idx & attention_mask.unsqueeze(-1).bool()
-
-    b_coords, seq_coords, _ = torch.where(mask_at_idx)
-
-
-    valid_targets = actual_idx[b_coords, seq_coords, 0]
-
-    # mode_seq = seq_coords.mode().values
-    # mask = seq_coords == mode_seq
-    # b_coords = b_coords[mask]
-    # seq_coords = seq_coords[mask]
-    # valid_targets = valid_targets[mask]
-    # import pdb; pdb.set_trace()
-    bad[b_coords, seq_coords, valid_targets] = 0
-
-    return sae_acts
-
-def load_pos_neg_feature_ids(phi_path: Path, top_k: int = 10, rank_i: int = 0, positive_only: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    """Return top-k feature indices by ascending/descending phi score."""
+    Filters to φ > 0 before selecting top-k starting at rank_i.
+    Returns a tuple (feature_ids, feature_values) where each element is a list
+    of 1D arrays (one per term). Arrays may be shorter than top_k if fewer
+    positive-φ features exist for that term.
+    """
     data = np.load(phi_path)
-    if positive_only:
-        sorted_phi_idx = data["sorted_phi_idx"].copy()
-        sorted_phi_values = data["sorted_phi_values"].copy()
-    else:
-        sorted_phi_idx = data["sorted_phi_idx"][:, ::-1].copy()
-        sorted_phi_values = data["sorted_phi_values"][:, ::-1].copy()
-    # feature_ids = sorted_phi_idx[:, rank_i: rank_i + top_k]
-    # logging.info(
-    #     f"Loaded {len(feature_ids)} {'positive' if positive_only else 'negative'}-phi features "
-    #     f"(out of {len(sorted_phi_idx)} total) from {phi_path}, using top {top_k}"
-    # )
-    return (sorted_phi_idx, sorted_phi_values)
+    sorted_phi_idx = data["sorted_phi_idx"]        # (n_terms, n_features)
+    sorted_phi_values = data["sorted_phi_values"]  # (n_terms, n_features)
+    n_terms = sorted_phi_idx.shape[0]
+    feature_ids_list: list[np.ndarray] = []
+    feature_values_list: list[np.ndarray] = []
+    for i in range(n_terms):
+        pos_mask = sorted_phi_values[i] > 0
+        pos_idx = sorted_phi_idx[i][pos_mask]
+        pos_val = sorted_phi_values[i][pos_mask]
+        selected_idx = pos_idx[rank_i: rank_i + top_k]
+        selected_val = pos_val[rank_i: rank_i + top_k]
+        if len(selected_idx) == 0:
+            logging.warning(
+                f"Term {i} has no positive-φ features at rank_i={rank_i} in {phi_path.name}; "
+                f"ablation will be a no-op for this term."
+            )
+        elif len(selected_idx) < top_k:
+            logging.warning(
+                f"Term {i} has only {len(selected_idx)} positive-φ features "
+                f"(requested top_k={top_k}, rank_i={rank_i}) in {phi_path.name}."
+            )
+        feature_ids_list.append(selected_idx)
+        feature_values_list.append(selected_val)
+    logging.info(
+        f"Loaded up to top-{top_k} positive-φ features per linguistic term "
+        f"(rank_i={rank_i}) from {phi_path}"
+    )
+    return feature_ids_list, feature_values_list
 
 def log_feature_sentence_distribution(
     phi_path: Path,
@@ -87,7 +142,6 @@ def log_feature_sentence_distribution(
     output_dir: Path | None = None,
     linguistic_terms_map: dict[str, int] | None = None,
 ) -> None:
-    """For each top feature, log pair-level counts per linguistic phenomenon."""
     h5_path = phi_path.with_suffix(".h5")
     if not h5_path.exists():
         logging.warning(f"H5 file not found at {h5_path}, skipping feature distribution logging.")
@@ -166,33 +220,21 @@ def log_feature_sentence_distribution(
         out_path = output_dir / f"{phi_path.stem}_feature_distribution.txt"
         out_path.write_text(text + "\n")
 
+def load_phi_scores(phi_path: Path) -> np.ndarray:
+    """Reconstruct dense φ score array of shape (n_terms, n_features).
 
-def load_random_feature_ids(phi_path: Path, top_k: int = 10, exclude_feature_ids: np.ndarray | None = None) -> np.ndarray:
-    """Return top_k random feature indices per linguistic phenomenon, using a different RNG seed per term."""
+    The .npz stores features sorted by descending φ; this inverts the sort
+    to produce a dense array indexed by feature id.
+    """
     data = np.load(phi_path)
-    sorted_phi_idx = data["sorted_phi_idx"]
-    sorted_phi_values = data["sorted_phi_values"]
+    sorted_phi_idx = data["sorted_phi_idx"]        # (n_terms, n_features)
+    sorted_phi_values = data["sorted_phi_values"]  # (n_terms, n_features)
+    n_terms, n_features = sorted_phi_idx.shape
+    phi_dense = np.zeros((n_terms, n_features), dtype=np.float32)
+    for i in range(n_terms):
+        phi_dense[i, sorted_phi_idx[i]] = sorted_phi_values[i]
+    return phi_dense
 
-    exclude_2d = np.asarray(exclude_feature_ids) if exclude_feature_ids is not None else None
-    result_rows = []
-    for term_idx in range(sorted_phi_idx.shape[0]):
-        term_active = np.unique(sorted_phi_idx[term_idx][sorted_phi_values[term_idx] != 0])
-        if exclude_2d is not None:
-            term_excl = exclude_2d[term_idx] if exclude_2d.ndim == 2 else exclude_2d.ravel()
-            term_active = term_active[~np.isin(term_active, term_excl)]
-        rng = np.random.default_rng(seed=term_idx)
-        if len(term_active) == 0:
-            logging.warning(f"Term {term_idx}: no activated features available for random sampling; using zeros.")
-            result_rows.append(np.zeros(top_k, dtype=sorted_phi_idx.dtype))
-            continue
-        sampled = rng.choice(term_active, size=top_k, replace=len(term_active) < top_k)
-        logging.info(
-            f"Term {term_idx}: sampled {len(sampled)} random control features "
-            f"(from {len(term_active)} activated eligible) from {phi_path}"
-        )
-        result_rows.append(sampled)
-    return np.stack(result_rows)
-    
 
 def save_dataset_evaluation_to_jsonl(output_dir, model_name, dataset_name, save_outputs, phi_files,
                                      all_layers_loglikelihoods_base, all_layers_loglikelihoods_abl, all_layers_loglikelihoods_random):
@@ -284,7 +326,7 @@ def save_dataset_evaluation_to_jsonl(output_dir, model_name, dataset_name, save_
         output_lines.append(f"Wilcoxon (well-form.,   alpha={bonferroni_alpha:.6f}): stat={wstat_w:.6f}, p={wpval_w:.6e}, sig={wpval_w < bonferroni_alpha}")
         output_lines.append(f"Wilcoxon (selectivity,  alpha={bonferroni_alpha:.6f}): stat={wstat_s:.6f}, p={wpval_s:.6e}, sig={wpval_s < bonferroni_alpha}")
         output_lines.append(f"Wilcoxon (delta_acc,    alpha={bonferroni_alpha:.6f}): stat={wstat_d:.6f}, p={wpval_d:.6e}, sig={wpval_d < bonferroni_alpha}")
-        output_lines.append("  Layer                           avg_pref_cv  avg_pref_wf  avg_ctrl_cv  avg_ctrl_wf  avg_sel_cv   avg_sel_wf   Wcv_p       Www_p       Wsel_p      delta_acc_abl  delta_acc_rnd  cv>0  wf~0  sel>0" )
+        output_lines.append("  Layer                           avg_pref_cv  avg_pref_wf  avg_ctrl_cv  avg_ctrl_wf  avg_sel_cv   avg_sel_rand   Wcv_p       Www_p       Wsel_p      delta_acc_abl  delta_acc_rnd  cv>0  wf~0  sel>0" )
         for layer_idx in range(n_layers):
             try:
                 wcl, wpl = wilcoxon(all_pref_margins_cv[layer_idx], all_ctrl_margins_cv[layer_idx], alternative="greater")
@@ -361,6 +403,8 @@ def main(args):
     model_name = args.model_name.replace("/", "_")
     output_dir = output_dir / model_name / "ablation_results"
     output_dir.mkdir(parents=True, exist_ok=True)
+    stats_path = output_dir / "ablation_feature_stats.csv"
+    stats_path.write_text("sae_id,linguistic_term,batch_start,batch_size,eligible_total,ablated_total\n")
     
     batch_size = args.batch_size
 
@@ -370,9 +414,9 @@ def main(args):
     for phi_path in phi_files:
         # Infer sae_id from filename
         sae_id = phi_path.stem
-        feature_ids = load_pos_neg_feature_ids(phi_path, top_k=args.top_k, rank_i=args.rank_i, positive_only=args.positive_only)
+        phi_scores = load_phi_scores(phi_path)  # (n_terms, n_features)
+        feature_ids = load_positive_feature_ids(phi_path, top_k=args.top_k, rank_i=args.rank_i)  # for logging only
         log_feature_sentence_distribution(args.phi_dir / phi_path.name, feature_ids[0], n_sentences=args.n_pairs * 2 if args.n_pairs else None, output_dir=output_dir, linguistic_terms_map=linguistic_terms_map)
-        random_feature_ids = load_random_feature_ids(phi_path, top_k=args.top_k, exclude_feature_ids=feature_ids[0])
         sae = load_sae_model(release, sae_id)
         # Collect log-likelihoods per linguistic term for this layer
         layer_loglik_abl    = {term: [] for term in sampled_sentences}
@@ -381,11 +425,10 @@ def main(args):
         for linguistic_term, sentences in tqdm.tqdm(sampled_sentences.items(), desc=f"{sae_id} terms", leave=False):
             for i in range(0, len(sentences), batch_size):
                 batch_sentences = sentences[i:i+batch_size]
-                feature_ids_batch = feature_ids[0][linguistic_terms_map[linguistic_term]]
-                feature_values_batch = feature_ids[1][linguistic_terms_map[linguistic_term]]
-                random_feature_ids_batch = random_feature_ids[linguistic_terms_map[linguistic_term]]
+                term_phi_scores = phi_scores[linguistic_terms_map[linguistic_term]]
                 batch_avg_sent_loglik_abl, batch_avg_sent_loglik_base, batch_avg_sent_loglik_random = run_model_with_ablation(
-                    model, args.model_name, sae, sae_id, feature_ids_batch, feature_values_batch, random_feature_ids_batch, batch_sentences
+                    model, args.model_name, sae, sae_id, term_phi_scores, args.top_k, batch_sentences,
+                    stats_path=stats_path, linguistic_term=linguistic_term, batch_start=i,
                 )
                 layer_loglik_abl[linguistic_term].extend(batch_avg_sent_loglik_abl.tolist())
                 layer_loglik_base[linguistic_term].extend(batch_avg_sent_loglik_base.tolist())
@@ -403,34 +446,52 @@ def run_model_with_ablation(
     model_name,
     sae: SAE,
     sae_id: str,
-    feature_ids: np.ndarray,
-    feature_values: np.ndarray,
-    random_feature_ids: np.ndarray,
+    phi_scores: np.ndarray,
+    top_k: int,
     sampled_sentences: list[str],
     prepend_bos: bool = True,
+    stats_path: Path | None = None,
+    linguistic_term: str | None = None,
+    batch_start: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     layer_number = extract_layer_number(sae_id)
     if 'gpt2' in model_name:
-        # GPT 2 specifics
+        # GPT-2: no pad token, uses eos for right-padding
         pad_id = model.tokenizer.eos_token_id
         hook_block_name = f'blocks.{layer_number}.hook_in.hook_sae_acts_post'
     else:
-        pad_id = model.tokenizer.pad_token_id
+        # Gemma and others: left-padded; fall back to eos_token_id if pad_token_id is None
+        pad_id = model.tokenizer.pad_token_id or model.tokenizer.eos_token_id
         hook_block_name = f'blocks.{layer_number}.hook_out.hook_sae_acts_post'
     input_ids = model.to_tokens(sampled_sentences, prepend_bos=prepend_bos)
-    masks, _ = make_blimp_prefix_mask(input_ids)
-    attention_mask = (input_ids != pad_id).long() * masks.long()  # shape: (B, L)
-    # ---- ablated pass ------------------------------------------------
+    attention_mask, full_batch_div = compute_attention_mask_and_divergence(input_ids, pad_id)
+    # Convert φ scores and masks to tensors on device
+    phi_t  = torch.from_numpy(phi_scores).to(input_ids.device)
+    attn_t = attention_mask.to(input_ids.device)
+    hook_stats: list[dict] = []
+    # ---- ablated pass: top-k φ-ranked features active at/after divergence token ----
     logits_abl = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
-        prepend_bos=prepend_bos,
+        prepend_bos=True,
         use_error_term=True,
-        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=feature_ids, feature_values=feature_values, attention_mask=attention_mask))],
+        fwd_hooks=[(hook_block_name, partial(
+            ablate_top_k_active_phi,
+            phi_scores=phi_t, top_k=top_k,
+            attention_mask=attn_t, divergence_indices=full_batch_div,
+            stats_sink=hook_stats,
+        ))],
     )
+    if stats_path is not None and hook_stats:
+        s = hook_stats[-1]
+        with stats_path.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{sae_id},{linguistic_term or ''},{batch_start if batch_start is not None else -1},"
+                f"{s['batch_size']},{s['eligible_total']},{s['ablated_total']}\n"
+            )
     model.reset_saes()
     model.reset_hooks()
-    # ---- baseline pass (SAE active, no features ablated) -------------
+    # ---- baseline pass ------------------------------------------------
     logits_base = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
@@ -440,29 +501,66 @@ def run_model_with_ablation(
     )
     model.reset_saes()
     model.reset_hooks()
-    # ---- random pass ------------------------------------------------
+    # ---- random pass: top-k random features active at/after divergence token --------
     logits_random = model.run_with_hooks_with_saes(
         sampled_sentences,
         saes=[sae],
-        prepend_bos=prepend_bos,
+        prepend_bos=True,
         use_error_term=True,
-        fwd_hooks=[(hook_block_name, partial(ablate_features, feature_ids=feature_ids, feature_values=feature_values, attention_mask=attention_mask, is_control=True))],
+        fwd_hooks=[(hook_block_name, partial(
+            ablate_random_active,
+            top_k=top_k, attention_mask=attn_t, divergence_indices=full_batch_div,
+        ))],
     )
-
+    model.reset_saes()
+    model.reset_hooks()
     batch_avg_sent_loglik_abl = compute_log_likelihood(logits_abl, input_ids, attention_mask)
     batch_avg_sent_loglik_base = compute_log_likelihood(logits_base, input_ids, attention_mask)
     batch_avg_sent_loglik_random = compute_log_likelihood(logits_random, input_ids, attention_mask)
     return batch_avg_sent_loglik_abl, batch_avg_sent_loglik_base, batch_avg_sent_loglik_random
 
 
+def compute_attention_mask_and_divergence(
+    input_ids: torch.Tensor,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (attention_mask, divergence_indices) for interleaved good/bad batches.
+
+    input_ids is expected in interleaved order:
+    [good_0, bad_0, good_1, bad_1, ...].
+    divergence_indices has shape [batch] and assigns the same first-difference
+    index to each good/bad sentence pair while ignoring padding-only positions.
+    """
+    attention_mask = (input_ids != pad_id).long()
+    good_ids = input_ids[0::2]      # [n_pairs, seq]
+    bad_ids = input_ids[1::2]       # [n_pairs, seq]
+    good_attn = attention_mask[0::2]
+    bad_attn = attention_mask[1::2]
+
+    # Compare only at positions that are real tokens in both sentences.
+    both_real = (good_attn & bad_attn).bool()  # [n_pairs, seq]
+    diff = (good_ids != bad_ids) & both_real   # [n_pairs, seq]
+
+    # If a pair has no valid difference (rare), fall back to first both-real token.
+    has_diff = diff.any(dim=1)
+    first_diff = diff.float().argmax(dim=1)
+    first_both_real = both_real.float().argmax(dim=1)
+    pair_div = torch.where(has_diff, first_diff, first_both_real)
+
+    full_batch_div = torch.zeros(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+    full_batch_div[0::2] = pair_div
+    full_batch_div[1::2] = pair_div
+    return attention_mask, full_batch_div
+
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     torch.set_grad_enabled(False)
-
     parser = argparse.ArgumentParser(
         description="Ablate positive-phi SAE features and measure log-likelihood impact on BLIMP pairs."
     )
@@ -485,7 +583,7 @@ if __name__ == '__main__':
         default=PROJECT_ROOT / "output" / "features",
     )
     parser.add_argument("--split_name", type=str, default="test", help="Name of the dataset split (e.g., 'train', 'test') to look for in --phi_dir.")
-    parser.add_argument("--positive_only", action="store_true", help="Only ablate features with positive phi.")
+
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument(
         "--n_pairs", type=int, default=None,

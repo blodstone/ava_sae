@@ -9,8 +9,8 @@ import h5py
 import numpy as np
 
 def _process_one_wrapper(args_tuple):
-    h5_path, sampled_sentences, linguistic_terms_map, out_path, sentence_idx, start_idx, end_idx, use_ttest = args_tuple
-    return _process_one(h5_path, sampled_sentences, linguistic_terms_map, out_path, sentence_idx, start_idx, end_idx, use_ttest)
+    h5_path, sampled_sentences, linguistic_terms_map, out_path, sentence_idx, start_idx, end_idx = args_tuple
+    return _process_one(h5_path, sampled_sentences, linguistic_terms_map, out_path, sentence_idx, start_idx, end_idx)
 
 def _resolve_sentence_indices(n_sentences: int, sentence_idx: int | None, start_idx: int, end_idx: int | None):
     if sentence_idx is not None:
@@ -51,133 +51,94 @@ def _read_sentence_sparse(h5f: h5py.File, sent_idx: int):
     }
 
 
-def compute_phi_l_ttest(
+def compute_phi_l(
     h5f: h5py.File,
-    sampled_sentences: list[tuple[str, int]],
+    sampled_sentences: list[str],
     linguistic_terms_map: dict[str, int],
     sentence_indices: list[int],
     n_features: int,
 ):
     if len(sentence_indices) % 2 != 0:
         raise ValueError("sentence_indices must contain an even number of entries (good/bad pairs).")
-    
     n_linguistic_terms = len(linguistic_terms_map) 
-    n_pairs_total = len(sentence_indices) // 2
-    
-    if n_pairs_total == 0:
-        raise ValueError("No sentence pairs provided.")
+    n_pairs = len(sentence_indices) // 2
+    bad_phi_sum = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
+    good_phi_sum = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
+    bad_phi_count = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
+    good_phi_count = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
+    phi_sum = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
+    instance_count = np.zeros(n_linguistic_terms, dtype=np.int32)
+    total_tokens = 0
 
-    # Track running sums for mean and variance
-    sum_d = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
-    sum_d_sq = np.zeros((n_linguistic_terms, n_features), dtype=np.float64)
-    
-    # Track number of pairs (N) per linguistic term
-    n_pairs_term = np.zeros(n_linguistic_terms, dtype=np.int32)
+    # Track pair-level counts for correct distribution reporting
+    bad_only_pair_count = np.zeros((n_linguistic_terms, n_features), dtype=np.int32)   # bad but not good (φ-eligible)
+    good_only_pair_count = np.zeros((n_linguistic_terms, n_features), dtype=np.int32)  # good but not bad
+    both_pair_count = np.zeros((n_linguistic_terms, n_features), dtype=np.int32)       # both good and bad
 
     for idx in tqdm.tqdm(range(0, len(sampled_sentences), 2), desc="Processing sentence pairs"):
         linguistic_term, global_idx = sampled_sentences[idx]  
         linguistic_term_index = linguistic_terms_map[linguistic_term]
-        
         good_idx = sentence_indices[global_idx]
         bad_idx = sentence_indices[global_idx + 1]
-        
         good_sent_data = _read_sentence_sparse(h5f, good_idx)
         bad_sent_data = _read_sentence_sparse(h5f, bad_idx)
         
-        # Find valid sequence length (T) excluding BOS
-        t_len = min(len(good_sent_data["tokens"]), len(bad_sent_data["tokens"]))
-        t_valid = max(1, t_len - 1) 
-        
+        t = min(len(good_sent_data["tokens"]), len(bad_sent_data["tokens"]))
+        # if t == 0:
+        #     continue
+        # Exclude BOS token (index 0) from both sentences before computing phi
         good_bos_mask = good_sent_data["token_idx"] != 0
         bad_bos_mask  = bad_sent_data["token_idx"]  != 0
+        good_feat_set = set(good_sent_data["feature_idx"][good_bos_mask])
+        bad_feat_set  = set(bad_sent_data["feature_idx"][bad_bos_mask])
 
-        # Create temporary dense array for the pair-wise difference d_i
-        d_i = np.zeros(n_features, dtype=np.float64)
-        
-        # Add bad activations, subtract good activations
-        np.add.at(d_i, bad_sent_data['feature_idx'][bad_bos_mask], bad_sent_data['feature_values'][bad_bos_mask])
-        np.add.at(d_i, good_sent_data['feature_idx'][good_bos_mask], -good_sent_data['feature_values'][good_bos_mask])
-        
-        # Average the difference over valid sequence length T
-        d_i /= t_valid
+        # Pair-level set operations
+        bad_only  = bad_feat_set - good_feat_set   # φ-eligible
+        good_only = good_feat_set - bad_feat_set
+        both      = good_feat_set & bad_feat_set
+        bad_only_mask = ~np.isin(bad_sent_data['feature_idx'], good_sent_data['feature_idx'])
 
-        # Optimize by only extracting and updating active (non-zero) differences
-        active_indices = np.nonzero(d_i)[0]
-        
-        sum_d[linguistic_term_index, active_indices] += d_i[active_indices]
-        sum_d_sq[linguistic_term_index, active_indices] += d_i[active_indices] ** 2
-        
-        n_pairs_term[linguistic_term_index] += 1
+        np.add.at(bad_only_pair_count,  (linguistic_term_index, list(bad_only)),  1)
+        np.add.at(good_only_pair_count, (linguistic_term_index, list(good_only)), 1)
+        np.add.at(both_pair_count,      (linguistic_term_index, list(both)),      1)
 
-    # ---------------------------------------------------------
-    # Compute the T-Statistic
-    # ---------------------------------------------------------
-    
-    # Reshape N for broadcasting against the feature matrix
-    N = n_pairs_term[:, np.newaxis]
-    
-    # Temporarily ignore numpy warnings for division by zero (handled by nan_to_num)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        
-        # 1. Mean difference
-        mean_d = sum_d / N
-        
-        # 2. Sample variance: s^2 = [ sum(d^2) - (sum(d)^2 / N) ] / (N - 1)
-        var_d = (sum_d_sq - (sum_d ** 2) / N) / (N - 1)
-        
-        # 3. Standard Error: SE = sqrt(s^2 / N)
-        std_error = np.sqrt(var_d / N)
-        
-        # 4. T-Statistic: t = mean_d / SE
-        t_stat = mean_d / std_error
+        # accumulation (unchanged)
 
-    # Clean up NaNs and Infs (e.g., where N < 2, or variance is exactly 0)
-    t_stat = np.nan_to_num(t_stat, nan=0.0, posinf=0.0, neginf=0.0)
+        np.add.at(bad_phi_sum, (linguistic_term_index, bad_sent_data['feature_idx']), bad_sent_data['feature_values'].astype(np.float64))
+        np.add.at(good_phi_sum, (linguistic_term_index, good_sent_data['feature_idx']), good_sent_data['feature_values'].astype(np.float64))
+        np.add.at(bad_phi_count, (linguistic_term_index, bad_sent_data['feature_idx']), 1)
+        np.add.at(good_phi_count, (linguistic_term_index, good_sent_data['feature_idx']), 1)
 
-    return t_stat
-
-def compute_phi_l(
-    h5f: h5py.File,
-    sampled_sentences: list,
-    linguistic_terms_map: dict[str, int],
-    sentence_indices: list[int],
-    n_features: int,
-    lambda_: float = 1.0
-) -> np.ndarray:
-    """
-    Compute Phi_j^(l) = (1 / (|D| * T)) * sum_i sum_t (z_bad - z_good)
-    over paired sentence indices [good_0, bad_0, good_1, bad_1, ...].
-    Returns shape: (n_features,).
-    """
-    if len(sentence_indices) % 2 != 0:
-        raise ValueError("sentence_indices must contain an even number of entries (good/bad pairs).")
-
-    n_pairs = len(sentence_indices) // 2
-    phi_sum = np.zeros(n_features, dtype=np.float64)
-    total_tokens = 0
-
-    for pos in tqdm.tqdm(range(0, len(sentence_indices), 2)):
-        good_idx = sentence_indices[pos]
-        bad_idx = sentence_indices[pos + 1]
-
-        good_sent_data = _read_sentence_sparse(h5f, good_idx)
-        bad_sent_data = _read_sentence_sparse(h5f, bad_idx)
-
-        t = min(len(good_sent_data["tokens"]), len(bad_sent_data["tokens"]))
-        if t == 0:
-            continue
-
-        np.add.at(phi_sum, bad_sent_data["feature_idx"], bad_sent_data["feature_values"].astype(np.float64))
-        np.add.at(phi_sum, good_sent_data["feature_idx"], -lambda_ * good_sent_data["feature_values"].astype(np.float64) * good_sent_data["feature_values"].astype(np.float64))
         total_tokens += t
-
+    bad_phi_avg  = np.where(bad_phi_count  > 0, bad_phi_sum  / np.where(bad_phi_count  > 0, bad_phi_count,  1), 0.0)
+    good_phi_avg = np.where(good_phi_count > 0, good_phi_sum / np.where(good_phi_count > 0, good_phi_count, 1), 0.0)
+    # phi_sum = (bad_phi_avg - good_phi_avg).astype(np.float32)
+    # import pdb; pdb.set_trace()
+    phi_sum = (bad_only_pair_count).astype(np.float32) - (good_only_pair_count).astype(np.float32)  # φ-eligible pairs only
     if total_tokens == 0 or n_pairs == 0:
         raise ValueError("No sentence pairs provided.")
 
-    return (phi_sum / float(total_tokens)).astype(np.float32)
+    # distribution = {
+    #     "bad_only_pairs":  bad_only_pair_count,   # should match φ; good_% = 0 by construction
+    #     "good_only_pairs": good_only_pair_count,
+    #     "both_pairs":      both_pair_count,
+    #     "n_pairs":         n_pairs,
+    # }
 
+    # distribution_lines = ["Distribution of feature presence across good/bad pairs:"]
+    # for category, counts in distribution.items():
+    #     if category != "n_pairs":
+    #         distribution_lines.append(
+    #             f"  {category}: {np.sum(counts)} features (mean {np.mean(counts):.2f} pairs/feature)"
+    #         )
+    #     else:
+    #         distribution_lines.append(f"  {category}: {counts}")
+    # distribution["summary_text"] = "\n".join(distribution_lines)
+    
+    # phi_l = (phi_sum / float(total_tokens)).astype(np.float32)
+    return phi_sum
 
-def _process_one(h5_path: Path, sampled_sentences: list[str], linguistic_terms_map: dict[str, int], out_path: Path, sentence_idx, start_idx: int, end_idx, use_ttest: bool) -> None:
+def _process_one(h5_path: Path, sampled_sentences: list[str], linguistic_terms_map: dict[str, int], out_path: Path, sentence_idx, start_idx: int, end_idx) -> None:
 
     with h5py.File(h5_path, "r") as h5f:
         ds_offsets = cast(h5py.Dataset, h5f["offsets"])
@@ -189,10 +150,7 @@ def _process_one(h5_path: Path, sampled_sentences: list[str], linguistic_terms_m
             start_idx=start_idx,
             end_idx=end_idx,
         )
-        if use_ttest:
-            phi_l = compute_phi_l_ttest(h5f, sampled_sentences=sampled_sentences, linguistic_terms_map=linguistic_terms_map, sentence_indices=sentence_indices, n_features=n_features)
-        else:
-            phi_l = compute_phi_l(h5f, sampled_sentences=sampled_sentences, linguistic_terms_map=linguistic_terms_map, sentence_indices=sentence_indices, n_features=n_features)
+        phi_l = compute_phi_l(h5f, sampled_sentences=sampled_sentences, linguistic_terms_map=linguistic_terms_map, sentence_indices=sentence_indices, n_features=n_features)
     sorted_phi_idx = np.argsort(phi_l, axis=1)[:, ::-1]
     sorted_phi_values = np.take_along_axis(phi_l, sorted_phi_idx, axis=1)   
     np.savez_compressed(
@@ -231,7 +189,7 @@ def main(args):
             out_dir.mkdir(exist_ok=True)
             out_path = out_dir / h5_path.name.replace(".h5", ".npz")
             tasks.append((h5_path, sampled_sentences, linguistic_terms_map, out_path,
-                  args.sentence_idx, args.start_idx, args.end_idx, args.use_ttest))
+                  args.sentence_idx, args.start_idx, args.end_idx))
             # logging.info(f"Split: {args.split_name}, Processing {h5_path.name} -> {out_path.name}")
             # _process_one(h5_path, sampled_sentences, linguistic_terms_map, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.lambda_)
         with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
@@ -247,7 +205,7 @@ def main(args):
         if args.h5_path is None:
             raise ValueError("Provide either --h5_path or --h5_dir.")
         out_path = args.out_path if args.out_path is not None else args.h5_path.with_suffix(".npz")
-        _process_one(args.h5_path, sampled_sentences, linguistic_terms_map, out_path, args.sentence_idx, args.start_idx, args.end_idx, args.use_ttest)
+        _process_one(args.h5_path, sampled_sentences, linguistic_terms_map, out_path, args.sentence_idx, args.start_idx, args.end_idx)
 
 
 if __name__ == '__main__':
@@ -267,6 +225,5 @@ if __name__ == '__main__':
     parser.add_argument("--end_idx", type=int, default=None, help="End of sentence range (exclusive). Defaults to all sentences.")
     parser.add_argument("--lambda_", type=float, default=1.0, help="Regularization parameter.")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of parallel workers for processing multiple .h5 files.")
-    parser.add_argument("--use_ttest", action="store_true", help="Whether to compute the T-test based sensitivity score instead of the original phi_l.")
     args = parser.parse_args()
     main(args)

@@ -39,3 +39,8 @@ dev = [
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that load real models and may require network/GPU",
+]
